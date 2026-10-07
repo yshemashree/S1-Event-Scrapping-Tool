@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Created when the scraper runs
+settings.json
+cache/
+logs/
+backups/
+diagnostics/
+*.xlsx
+~$*.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
