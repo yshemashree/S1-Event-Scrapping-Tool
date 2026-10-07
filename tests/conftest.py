@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import faulthandler
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -13,6 +14,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fakesites import start_fake_web  # noqa: E402
 
 TODAY = date(2026, 10, 8)
+
+
+@pytest.fixture(autouse=True)
+def _watchdog():
+    """A test stuck for 2 minutes prints every thread's stack and stops the run,
+    instead of hanging silently (e.g. a GUI toolkit waiting on the window server)."""
+    faulthandler.dump_traceback_later(120, exit=True)
+    yield
+    faulthandler.cancel_dump_traceback_later()
 
 
 @pytest.fixture(scope="session")

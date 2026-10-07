@@ -57,7 +57,7 @@ class App:
         self._build()
         self._load_into_form()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        root.after(100, self._poll)
+        self._poll_job = root.after(100, self._poll)
 
     # --------------------------------------------------------------- layout
     def _style(self) -> None:
@@ -384,7 +384,7 @@ class App:
                     messagebox.showerror(APP_NAME, f"The run failed:\n\n{item[1]}")
         except queue.Empty:
             pass
-        self.root.after(100, self._poll)
+        self._poll_job = self.root.after(100, self._poll)
 
     def _finish(self, report) -> None:
         self._busy(False)

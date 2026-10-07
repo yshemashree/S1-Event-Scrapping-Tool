@@ -19,8 +19,18 @@ def _display_available():
 pytestmark = pytest.mark.skipif(not _display_available(), reason="no display (use xvfb-run)")
 
 
+@pytest.fixture(scope="module")
+def tk_root():
+    """One Tk interpreter for the whole module: creating and destroying several
+    in one process is unreliable on macOS."""
+    root = tk.Tk()
+    root.withdraw()
+    yield root
+    root.destroy()
+
+
 @pytest.fixture
-def app(tmp_path, monkeypatch):
+def app(tk_root, tmp_path, monkeypatch):
     from s1scraper import gui
     from s1scraper.config import Settings
 
@@ -29,21 +39,28 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: False)
     monkeypatch.setattr(gui.messagebox, "showerror", lambda *a, **k: None)
     monkeypatch.setattr(gui.messagebox, "showinfo", lambda *a, **k: None)
-    root = tk.Tk()
-    root.withdraw()
-    application = gui.App(root, settings_path)
+    window = tk.Toplevel(tk_root)
+    window.withdraw()
+    application = gui.App(window, settings_path)
     yield application
-    root.destroy()
+    window.after_cancel(application._poll_job)
+    window.destroy()
 
 
 def pump(app, until, timeout=10):
-    end = time.time() + timeout
-    while time.time() < end:
-        app.root.update()
-        if until():
-            return True
-        time.sleep(0.02)
-    return False
+    """Run the normal Tk event loop (as the real app does) until ``until()`` or timeout."""
+    window = app.root
+    deadline = time.time() + timeout
+
+    def check():
+        if until() or time.time() > deadline:
+            window.quit()
+        else:
+            window.after(50, check)
+
+    window.after(50, check)
+    window.mainloop()
+    return until()
 
 
 def test_form_round_trips_settings(app):

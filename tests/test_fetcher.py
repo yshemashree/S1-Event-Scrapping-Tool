@@ -155,10 +155,12 @@ def test_network_errors_are_reported_not_raised():
 def test_unreachable_site_is_skipped_after_two_pages():
     f = Fetcher(Politeness(min_delay=0, max_delay=0, backoff_base=0.01, respect_robots_txt=False), HttpCache(None),
                 threading.Event(), lambda u: "http://127.0.0.1:9/nothing")
-    t0 = time.monotonic()
     assert f.get("https://down.test/a", cache_hours=0).error
     assert not f.is_disabled("down.test")
     assert f.get("https://down.test/b", cache_hours=0).error
     assert "could not be reached" in f.is_disabled("down.test")
+    # the third page must not touch the network at all (a refused connection
+    # alone takes ~2 s on Windows, so only this call is timed)
+    t0 = time.monotonic()
     res = f.get("https://down.test/c", cache_hours=0)
-    assert res.blocked and time.monotonic() - t0 < 5
+    assert res.blocked and time.monotonic() - t0 < 0.5
