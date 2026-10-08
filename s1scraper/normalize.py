@@ -66,6 +66,25 @@ def first_sentences(text: str, max_chars: int = 200) -> str:
     return out
 
 
+_INTRO_RE = re.compile(r"^(?:about(?: the)?(?: event| show)?|event (?:details|description)|description|overview)"
+                       r"\s*[:\-–]\s*", re.I)
+
+
+def one_line(text: str, max_chars: int = 140) -> str:
+    """The first sentence of a description, as one short line ("what is this event")."""
+    text = _INTRO_RE.sub("", clean_text(text))
+    sentences = [s for s in _SENTENCE_RE.split(text) if s.strip()]
+    if not sentences:
+        return ""
+    line = sentences[0].strip()
+    if len(line) < 20 and len(sentences) > 1 and len(line) + 1 + len(sentences[1]) <= max_chars:
+        line = f"{line} {sentences[1].strip()}"      # "Live on stage!" alone says little
+    if len(line) > max_chars:
+        cut = line[: max_chars - 1]
+        line = (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(",;:-– ") + "…"
+    return line
+
+
 _TITLE_SUFFIX_RE = re.compile(
     r"\s*(?:[|\-–—:]\s*)?(?:buy\s+)?(?:event\s+)?tickets?(?:\s+online)?(?:\s+(?:at|on)\s+[\w .]+)?$"
     r"|\s*[|\-–—]\s*(?:bookmyshow|district(?: by zomato)?|zomato district|allevents(?:\.in)?|"

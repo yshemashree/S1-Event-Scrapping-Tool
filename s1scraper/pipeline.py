@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional
 
 from .browser import BrowserService, BrowserSettings
 from .cities import CITIES, City, detect_city, detect_other_city, resolve_cities
@@ -26,7 +26,7 @@ from .config import Settings
 from .dedupe import dedupe
 from .fetcher import Cancelled, Fetcher, HttpCache
 from .models import Event
-from .normalize import first_sentences, format_inr, format_time, host_of, now_ist, today_ist
+from .normalize import host_of, now_ist, one_line, today_ist
 from .sources import SOURCE_BY_KEY, RunContext, Source, platform_for_url
 
 log = logging.getLogger(__name__)
@@ -95,53 +95,30 @@ def in_window(ev: Event, start: date, end: date) -> bool:
     return any(start <= d <= end for d in ev.session_dates)
 
 
-def _compact_dates(days: Sequence[date]) -> str:
-    days = sorted(set(days))
-    if not days:
-        return ""
-    shown = days[:6]
-    parts: List[str] = []
-    for i, d in enumerate(shown):
-        nxt = shown[i + 1] if i + 1 < len(shown) else None
-        same_month_as_next = nxt is not None and (nxt.month, nxt.year) == (d.month, d.year)
-        parts.append(str(d.day) if same_month_as_next else f"{d.day} {d:%b}")
-    text = ", ".join(parts)
-    if len(days) > 6:
-        text += f" +{len(days) - 6} more"
-    return text
+_KIND_PHRASES = {
+    "Comedy": "comedy show", "Music": "live music", "Theatre": "theatre play", "F&B": "food and drinks event",
+    "Art": "art event", "Culture": "cultural event", "Sports to Watch": "sports match",
+    "Recreational Sports": "sports activity", "Workshops": "workshop",
+}
 
 
 def build_notes(ev: Event) -> str:
-    facts: List[str] = []
+    """One short line on what the event is, like StepOne's own notes ("Stand-up comedy.",
+    "Bollywood composer-singer live concert."). Dates, times and prices have their own columns."""
+    line = one_line(ev.description) if ev.description else ""
+    if not line:
+        kinds = [c for c in ev.categories if c.lower() not in _GENERIC_CATEGORIES][:2]
+        line = ", ".join(kinds) or _KIND_PHRASES.get(ev.activity_type, "")
+        if ev.language:
+            line = f"{line} in {ev.language}" if line else ev.language
+        performers = [p for p in ev.performers if p and p.lower() not in ev.title.lower()][:2]
+        if performers:
+            line = f"{line} featuring {' and '.join(performers)}" if line else "Featuring " + " and ".join(performers)
+        if line:
+            line = line[0].upper() + line[1:] + "."
     if ev.status:
-        facts.append(ev.status.upper())
-    single_day = ev.start is not None and (ev.end is None or ev.end.date() == ev.start.date())
-    if ev.start is not None and ev.has_time and single_day:
-        facts.append(format_time(ev.start))
-    if len(set(ev.session_dates)) > 1:
-        facts.append("Dates: " + _compact_dates(ev.session_dates))
-    genres = [c for c in ev.categories
-              if c.lower() not in _GENERIC_CATEGORIES and c.lower() != ev.activity_type.lower()][:2]
-    if genres:
-        facts.append(", ".join(genres))
-    if ev.language:
-        facts.append(ev.language)
-    if ev.age_limit:
-        age = ev.age_limit
-        facts.append(age if age.lower().startswith(("age", "all", "for ")) else f"Age {age}")
-    if ev.duration:
-        facts.append(ev.duration)
-    types = sorted({(n, p) for n, p in ev.ticket_types if p}, key=lambda t: t[1])
-    if len(types) >= 2:
-        facts.append("Tickets: " + ", ".join(f"{n} {format_inr(p)}" for n, p in types[:4]))
-    performers = [p for p in ev.performers if p and p.lower() not in ev.title.lower()][:3]
-    if performers:
-        facts.append("Artists: " + ", ".join(performers))
-    head = " · ".join(facts)
-    desc = first_sentences(ev.description, 180) if ev.description else ""
-    if desc and head:
-        return (head + ". " + desc)[:450]
-    return (head or desc)[:450]
+        line = f"{ev.status.upper()}. {line}".strip()
+    return line
 
 
 class Runner:

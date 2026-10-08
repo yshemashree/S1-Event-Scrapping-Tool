@@ -158,7 +158,7 @@ class App:
         ttk.Checkbutton(box, text="Open pages in Chrome/Edge when needed", variable=self.browser_var).pack(side="left")
         self.show_browser_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(box, text="Show the browser", variable=self.show_browser_var).pack(side="left", padx=(12, 0))
-        self.city_tabs_var = tk.BooleanVar(value=True)
+        self.city_tabs_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(box, text="One tab per city", variable=self.city_tabs_var).pack(side="left", padx=(12, 0))
 
         # actions
@@ -208,7 +208,7 @@ class App:
         self.speed_var.set(next((k for k, v in SPEEDS.items() if v == s.speed), "Normal (recommended)"))
         self.browser_var.set(bool(s.use_browser))
         self.show_browser_var.set(bool(s.show_browser))
-        self.city_tabs_var.set(bool(s.per_city_tabs))
+        self.city_tabs_var.set(bool(s.city_tabs))
         self._sync_window()
 
     def _read_form(self) -> Settings:
@@ -224,7 +224,7 @@ class App:
         s.speed = SPEEDS.get(self.speed_var.get(), "normal")
         s.use_browser = self.browser_var.get()
         s.show_browser = self.show_browser_var.get()
-        s.per_city_tabs = self.city_tabs_var.get()
+        s.city_tabs = self.city_tabs_var.get()
         return s
 
     def _sync_window(self) -> None:

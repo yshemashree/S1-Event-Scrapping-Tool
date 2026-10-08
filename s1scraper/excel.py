@@ -5,9 +5,10 @@
   row, and a hidden index remembers every event ever added, so an event is
   never added twice - not even after its row was deleted by hand.
 * **Rolling Calendar** is rebuilt from scratch on every run for the chosen
-  window, in the Master's visual style, grouped by month.
-* Optional per-city tabs, a **Summary** sheet with live formulas and an
-  append-only **Run Log**.
+  window, in the Master's visual style, city by city, each city in date order.
+* A hidden append-only **Run Log**, and optional per-city tabs and a
+  **Summary** sheet with live formulas (off by default: the client works
+  from the Master and the Rolling Calendar only).
 
 The file is backed up before saving and saved atomically. If Excel has it
 open (locked), results go to a new file next to it instead.
@@ -58,11 +59,8 @@ TIER_STYLES = {  # fill, font colour
     "Premium": ("E8F5E9", "1A5C2E"), "Standard": ("EFEFEF", "4A4A4A"), TIER_UNKNOWN: ("FFFFFF", "9A9A9A"),
 }
 REGION_STYLES = {"India": ("E8F0FA", "1A3A5C"), "Intl": ("FFE8CC", "7D4000")}
-MONTH_FILLS = {
-    1: "2E1A5C", 2: "1B4F72", 3: "6E2C00", 4: "145A32", 5: "512E5F", 6: "2C3E50",
-    7: "1A5276", 8: "1E8449", 9: "784212", 10: "4A235A", 11: "7D1A1A", 12: "1A3A1A",
-}
 CITY_TAB_COLORS = ["C0392B", "2471A3", "7D3C98", "138D75", "B9770E", "A04000", "2E4053"]
+CITY_BAND_FILLS = ["7D1A1A", "1B4F72", "4A235A", "145A32", "784212", "6E2C00", "2C3E50", "1A1A1A"]
 
 DATE_FORMAT = "d mmm yyyy"
 
@@ -441,7 +439,15 @@ def append_to_master(wb: Workbook, master: Worksheet, events: Sequence[Event], r
     # centred S.No./type/tier/price/region, tier and region badges.
     centred = {"S.No.", "Activity Type", "Tier", "Price Range", "Region", "Added On"}
     border = _border()
-    for ev in sorted(new_events, key=lambda e: (e.start or datetime.max, e.city, e.title.lower())):
+    current_city = None
+    per_city = Counter(ev.city for ev in new_events)
+    for ev in sorted(new_events, key=lambda e: (_city_rank(e.city), e.start or datetime.max, e.title.lower())):
+        if ev.city != current_city:
+            row += 1
+            current_city = ev.city
+            count = per_city[ev.city]
+            band_row(master, row, f"{ev.city or 'Other'} · {count} event{'s' if count != 1 else ''}".upper(),
+                     CITY_BAND_FILLS[_city_rank(ev.city) % len(CITY_BAND_FILLS)], size=9, last_col=last_col)
         row += 1
         serial += 1
         values = event_row(ev, serial, run_at.date())
@@ -490,8 +496,8 @@ def _append_index(wb: Workbook, events: Sequence[Event], run_at: datetime) -> No
 
 def write_calendar_sheet(ws: Worksheet, title: str, subtitle: str, events: Sequence[Event],
                          added_on: Dict[str, date], window: Tuple[date, date], tab_color: Optional[str] = None,
-                         empty_message: str = "No events found for this window - see the Run Log sheet.") -> int:
-    """Lay out a calendar sheet (title, subtitle, header, month bands, rows). Returns last row."""
+                         empty_message: str = "No events found for this window. The app's log says why.") -> int:
+    """Lay out a calendar sheet (title, subtitle, header, city bands, rows). Returns last row."""
     ws.sheet_view.showGridLines = False
     ws.sheet_view.zoomScale = 100
     if tab_color:
@@ -511,20 +517,21 @@ def write_calendar_sheet(ws: Worksheet, title: str, subtitle: str, events: Seque
     border = _border(GRID)
     current = None
     serial = 0
-    city_order = {c.name: i for i, c in enumerate(CITIES)}
 
     def effective(ev: Event) -> date:
         return max(ev.start.date(), window[0]) if ev.start else window[1]
 
-    events = sorted(events, key=lambda e: (effective(e), e.start or datetime.max, city_order.get(e.city, 99),
+    # City by city (Mumbai, Pune, ... as in the app), each in date order.
+    events = sorted(events, key=lambda e: (_city_rank(e.city), effective(e), e.start or datetime.max,
                                            e.title.lower()))
+    per_city = Counter(ev.city for ev in events)
     for ev in events:
-        eff = effective(ev)
-        month = (eff.year, eff.month)
-        if month != current:
+        if ev.city != current:
             row += 1
-            band_row(ws, row, f"▌ {eff:%B %Y}".upper(), MONTH_FILLS[eff.month])
-            current = month
+            count = per_city[ev.city]
+            band_row(ws, row, f"▌ {ev.city or 'Other'} · {count} event{'s' if count != 1 else ''}".upper(),
+                     CITY_BAND_FILLS[_city_rank(ev.city) % len(CITY_BAND_FILLS)])
+            current = ev.city
         row += 1
         serial += 1
         values = event_row(ev, serial, added_on.get(ev.identity()))
@@ -548,6 +555,10 @@ def write_calendar_sheet(ws: Worksheet, title: str, subtitle: str, events: Seque
     ws.page_margins.left = ws.page_margins.right = 0.3
     ws.page_margins.top = ws.page_margins.bottom = 0.5
     return row
+
+
+def _city_rank(city: str) -> int:
+    return next((i for i, c in enumerate(CITIES) if c.name == city), len(CITIES))
 
 
 def _source_line(events: Sequence[Event], sources: Sequence[str]) -> str:
@@ -852,8 +863,8 @@ def write_workbook(settings, events: Sequence[Event], report) -> WriteResult:
     made.append(rolling_title)
     span = f"{window[0]:%d %b %Y} – {window[1]:%d %b %Y}".upper()
     title = f"ROLLING EVENTS CALENDAR · {span} · " + " · ".join(c.upper() for c in report.cities)
-    subtitle = (f"Sources: {_source_line(events, report.sources)}  |  {len(events)} events  |  Sorted by date, "
-                f"grouped by month  |  Last updated: {run_at:%d %b %Y, %I:%M %p} IST  |  Tier = entry ticket price "
+    subtitle = (f"Sources: {_source_line(events, report.sources)}  |  {len(events)} events  |  City by city, "
+                f"each in date order  |  Last updated: {run_at:%d %b %Y, %I:%M %p} IST  |  Tier = entry ticket price "
                 f"(see Guide)  |  Use the filter arrows in row 3 to pick a city, tier or category")
     failed = getattr(report, "failed_sources", None) or []
     if failed:
@@ -862,7 +873,7 @@ def write_workbook(settings, events: Sequence[Event], report) -> WriteResult:
     last_row = write_calendar_sheet(rolling, title, subtitle, events, added_on, window, tab_color="0E4D45")
 
     anchor = rolling_title
-    if settings.per_city_tabs:
+    if settings.city_tabs:
         for i, city in enumerate(report.cities):
             tab = _safe_title(wb, city, generated)
             ws = _replace_sheet(wb, tab, generated, after=anchor)
@@ -875,7 +886,7 @@ def write_workbook(settings, events: Sequence[Event], report) -> WriteResult:
                 f"Last updated: {run_at:%d %b %Y, %I:%M %p} IST",
                 city_events, added_on, window, tab_color=CITY_TAB_COLORS[i % len(CITY_TAB_COLORS)],
                 empty_message=f"No events found in {city} for this window.")
-    if settings.summary_sheet:
+    if settings.summary_tab:
         tab = _safe_title(wb, SUMMARY_SHEET, generated)
         ws = _replace_sheet(wb, tab, generated, after=rolling_title)
         made.append(tab)
@@ -885,7 +896,7 @@ def write_workbook(settings, events: Sequence[Event], report) -> WriteResult:
             del wb[stale]
     append_run_log(wb, report, len(events), new_count)
     _remember_generated(wb, made)
-    for hidden in (INDEX_SHEET, META_SHEET):
+    for hidden in (RUN_LOG_SHEET, INDEX_SHEET, META_SHEET):
         if hidden in wb.sheetnames:
             wb[hidden].sheet_state = "hidden"
             wb.move_sheet(hidden, offset=len(wb.sheetnames) - 1 - wb.sheetnames.index(hidden))

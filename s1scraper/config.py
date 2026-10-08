@@ -87,11 +87,14 @@ class Settings:
     include_activities: bool = False       # BookMyShow "activities" (water parks, gaming zones ...)
     include_online: bool = False
     include_undated: bool = False
-    per_city_tabs: bool = True
-    summary_sheet: bool = True
+    city_tabs: bool = False                # extra tabs; by default the workbook is just Master + Rolling
+    summary_tab: bool = False
     backup_before_write: bool = True
     keep_backups: int = 15
     data_dir: str = ""                     # cache/, logs/, backups/ (default: the app folder)
+    schedule_frequency: str = "off"        # automatic runs: off / daily / weekly
+    schedule_day: str = "Friday"
+    schedule_time: str = "07:00"
 
     # ------------------------------------------------------------ persistence
     @classmethod
