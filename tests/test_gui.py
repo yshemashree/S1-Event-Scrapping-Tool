@@ -69,9 +69,13 @@ def test_form_round_trips_settings(app):
     app.city_vars["Pune"].set(False)
     app.source_vars["meetup"].set(False)
     app.speed_var.set("Gentle (safest, slowest)")
+    assert app.limit_var.get() == "1 hour"                 # the default time limit
+    app.limit_var.set("1.5 hours")
     s = app._read_form()
     assert s.window_preset == "2 weeks" and "Pune" not in s.cities and len(s.cities) == 6
-    assert s.sources["meetup"] is False and s.speed == "gentle"
+    assert s.sources["meetup"] is False and s.speed == "gentle" and s.time_limit_minutes == 90
+    app.limit_var.set("No limit")
+    assert app._read_form().time_limit_minutes == 0
 
 
 def test_custom_window_shows_validation(app):
@@ -113,3 +117,56 @@ def test_validation_error_does_not_start_a_run(app, monkeypatch):
         var.set(False)
     app.start_run()
     assert app.worker is None
+
+
+def test_save_schedule_registers_and_remembers(app, monkeypatch):
+    from s1scraper import gui
+    from s1scraper.config import Settings
+
+    calls = []
+    monkeypatch.setattr(gui, "install_schedule", lambda sched, path: calls.append(sched) or f"Scheduled: {sched.describe()}.")
+    monkeypatch.setattr(gui, "schedule_is_installed", lambda: True)
+    monkeypatch.setattr(gui, "schedule_check_needed", lambda: False)
+    assert app.schedule_label.cget("text") == "Off"
+    app.open_schedule()
+    app.freq_var.set("Every day")
+    app._sync_schedule()
+    assert str(app.day_box.cget("state")) == "disabled" and str(app.time_entry.cget("state")) == "normal"
+    app.freq_var.set("Every week")
+    app.day_var.set("Friday")
+    app.time_var.set("7:30")
+    app.save_schedule()
+    assert calls and calls[0].describe() == "Every Friday at 07:30"
+    assert "Every Friday at 07:30" in app.schedule_label.cget("text")
+    assert "Every Friday at 07:30" in app.schedule_status.cget("text")
+    saved = Settings.load(app.settings_path)
+    assert (saved.schedule_frequency, saved.schedule_day, saved.schedule_time) == ("weekly", "Friday", "07:30")
+    app.time_var.set("25:99")
+    app.save_schedule()
+    assert len(calls) == 1                      # invalid time: nothing registered
+
+
+@pytest.mark.parametrize("outcome, expect", [
+    ((True, ""), "background test passed"),
+    ((False, "[Errno 1] Operation not permitted"), "Full Disk Access"),
+])
+def test_save_schedule_runs_the_background_test(app, monkeypatch, outcome, expect):
+    from s1scraper import gui
+
+    shown, ended = [], []
+    answers = iter([None, outcome])
+    monkeypatch.setattr(gui, "install_schedule", lambda sched, path: f"Scheduled: {sched.describe()}.")
+    monkeypatch.setattr(gui, "schedule_is_installed", lambda: True)
+    monkeypatch.setattr(gui, "schedule_check_needed", lambda: True)
+    monkeypatch.setattr(gui, "start_schedule_check", lambda path: "check")
+    monkeypatch.setattr(gui, "schedule_check_outcome", lambda chk: next(answers))
+    monkeypatch.setattr(gui, "end_schedule_check", ended.append)
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda title, text, **kw: shown.append(text))
+    monkeypatch.setattr(gui.messagebox, "showwarning", lambda title, text, **kw: shown.append(text))
+    app.open_schedule()
+    app.freq_var.set("Every day")
+    app.time_var.set("06:00")
+    app.save_schedule()
+    assert "Testing" in app.schedule_label.cget("text")
+    assert pump(app, lambda: shown)
+    assert expect.lower() in shown[0].lower() and ended == ["check"] and app._check is None

@@ -107,6 +107,6 @@ def run_diagnostics(settings: Settings, out: Callable[[str], None] = print, even
         say(f"Browser used: {browser.description}")
     elif browser.start_error and settings.use_browser:
         say(f"Browser not available: {browser.start_error}")
-    say(f"Raw pages saved in: {folder}")
+    say(f"Report (report.txt) and raw pages saved in: {folder}")
     (folder / "report.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
     return 0

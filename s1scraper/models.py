@@ -53,6 +53,7 @@ class Event:
     image: str = ""
     status: str = ""              # Cancelled / Postponed / Sold out / ...
     online: bool = False
+    register_by: Optional[datetime] = None   # last moment to register / buy, when the site publishes one
     # Filled in by the pipeline
     activity_type: str = ""
     tier: str = ""
@@ -60,6 +61,9 @@ class Event:
     platforms: List[str] = field(default_factory=list)
     links: Dict[str, str] = field(default_factory=dict)   # platform -> buy-tickets url
     ticket_url: str = ""          # where tickets are sold, when different from url
+    register_by_inferred: bool = False   # no deadline published: open until the event starts
+    end_known: bool = True        # False: runs on many dates and the last one is not reliable
+    link_verified: bool = False   # the link was opened and showed this event
     detail_fetched: bool = False
     sources: List[str] = field(default_factory=list)
 
@@ -114,6 +118,9 @@ class Event:
                 self.end = None
         if other.end and not self.end:
             self.end = other.end
+        if other.register_by and (prefer_other or not self.register_by):
+            self.register_by = other.register_by
+        self.link_verified = self.link_verified or other.link_verified
         if other.price_min is not None and (prefer_other or self.price_min is None):
             self.price_min = other.price_min
         if other.price_max is not None and (prefer_other or self.price_max is None):

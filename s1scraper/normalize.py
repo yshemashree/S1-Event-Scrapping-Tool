@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+import unicodedata
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -26,6 +27,13 @@ def today_ist() -> date:
 # --------------------------------------------------------------------- text
 
 _WS_RE = re.compile(r"\s+")
+# Characters an .xlsx cannot hold: control codes and halves of emoji that a site cut in two.
+# One of these made Excel report the workbook as damaged.
+_XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+
+def xml_safe(value: str) -> str:
+    return _XML_ILLEGAL_RE.sub("", value)
 
 
 def clean_text(value: Any) -> str:
@@ -33,7 +41,7 @@ def clean_text(value: Any) -> str:
         return ""
     if not isinstance(value, str):
         value = str(value)
-    value = html.unescape(value).replace("\xa0", " ").replace("​", "")
+    value = xml_safe(html.unescape(value).replace("\xa0", " ").replace("​", ""))
     return _WS_RE.sub(" ", value).strip()
 
 
@@ -46,7 +54,9 @@ def strip_html(value: Any) -> str:
     return clean_text(text)
 
 
-_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'“(])")
+_SENTENCE_RE = re.compile(  # not after "vs." / "ft." / "Dr." ... ("Queen vs. ABBA" is one sentence)
+    r"(?<!\bvs\.)(?<!\bVs\.)(?<!\bft\.)(?<!\bFt\.)(?<!\bfeat\.)(?<!\bDr\.)(?<!\bMr\.)(?<!\bMrs\.)"
+    r"(?<!\bMs\.)(?<!\bSt\.)(?<!\bNo\.)(?<=[.!?])\s+(?=[A-Z0-9\"'“(])")
 
 
 def first_sentences(text: str, max_chars: int = 200) -> str:
@@ -70,10 +80,30 @@ _INTRO_RE = re.compile(r"^(?:about(?: the)?(?: event| show)?|event (?:details|de
                        r"\s*[:\-–]\s*", re.I)
 
 
+# Listing-site filler that says nothing about the event itself
+_FILLER_RE = re.compile(
+    r"^(?:(?:join|attend)\b.*\bon \w+ \d{1,2}, \d{4}|looking for things to do\b|book (?:online )?tickets? for\b|"
+    r"get your (?:\w+ )?tickets\b|.*\bis hosting this\b|don'?t miss\b.*\bon \w+ \d{1,2}, \d{4})",
+    re.I,
+)
+
+
+_MARKUP_RE = re.compile(r"<[^>]+>|\*\*|__|#{1,6}(?=\s)|\\(?=[|*_#\[\]])|`")
+
+
+def plain_text(text: str) -> str:
+    """Website text as plain words: no HTML or markdown, no emoji, no 𝗳𝗮𝗻𝗰𝘆 letters."""
+    text = unicodedata.normalize("NFKC", clean_text(text))
+    text = _MARKUP_RE.sub(" ", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) not in ("So", "Sk", "Co", "Cs", "Cf")
+                   and not "\ufe00" <= ch <= "\ufe0f")
+    return re.sub(r"\s+([.,!?;:])", r"\1", clean_text(text))
+
+
 def one_line(text: str, max_chars: int = 140) -> str:
     """The first sentence of a description, as one short line ("what is this event")."""
-    text = _INTRO_RE.sub("", clean_text(text))
-    sentences = [s for s in _SENTENCE_RE.split(text) if s.strip()]
+    text = _INTRO_RE.sub("", plain_text(text))
+    sentences = [s for s in _SENTENCE_RE.split(text) if s.strip() and not _FILLER_RE.match(s.strip())]
     if not sentences:
         return ""
     line = sentences[0].strip()
@@ -131,7 +161,11 @@ def titles_match(a: str, b: str) -> bool:
 
 # ---------------------------------------------------------------------- URLs
 
-_TRACKING_PARAMS = re.compile(r"^(utm_.*|gclid|fbclid|ref|referrer|source|src|_branch.*|mc_.*|igshid)$", re.I)
+# Tracking and app parameters that are not part of an event's address (Eventbrite's ?aff=...,
+# BookMyShow's ?webview=true): links in the sheet stay clean and identical across runs.
+_TRACKING_PARAMS = re.compile(
+    r"^(utm_.*|gclid|fbclid|ref|referrer|source|src|_branch.*|mc_.*|igshid|webview|aff|affiliate|_gl|srsltid|"
+    r"si|_ga|trk|tracking|campaign|cmp|share|shared|from|via|eventorigin|recid|recsource|searchid|position)$", re.I)
 
 
 def absolute_url(base: str, href: Optional[str]) -> str:
@@ -176,7 +210,10 @@ _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 def _to_ist_naive(dt: datetime) -> datetime:
     if dt.tzinfo is not None:
-        dt = dt.astimezone(IST).replace(tzinfo=None)
+        try:
+            dt = dt.astimezone(IST).replace(tzinfo=None)
+        except (ValueError, OverflowError):     # impossible offset: keep the wall-clock time
+            dt = dt.replace(tzinfo=None)
     return dt
 
 
@@ -256,10 +293,13 @@ def _parse_human_date(s: str, ref: date) -> Tuple[Optional[datetime], bool]:
     cleaned = _ORDINAL_RE.sub(r"\1", cleaned)
     cleaned = re.sub(r"\b(onwards|on wards|starting|starts|from|at|on|the|of|ist|hrs)\b", " ", cleaned)
     cleaned = re.sub(r"[|•·,]", " ", cleaned)
+    cleaned = re.sub(r"\+\s?\d[\d\s-]*", " ", cleaned)      # phone numbers, "+530" and the like
     cleaned = clean_text(cleaned)
     default = datetime(ref.year, ref.month, 1)
     try:
-        dt = du_parser.parse(cleaned, dayfirst=True, fuzzy=True, default=default)
+        # ignoretz: in page text a "+2400" or a phone number ("+91 98200 ...") is not a time zone;
+        # an impossible offset there crashed the run later when dates were compared.
+        dt = du_parser.parse(cleaned, dayfirst=True, fuzzy=True, default=default, ignoretz=True)
     except (ValueError, OverflowError, TypeError):
         return None, False
     if not _YEAR_RE.search(low) and dt.date() < ref - timedelta(days=45):

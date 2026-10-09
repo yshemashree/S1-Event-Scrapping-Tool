@@ -91,3 +91,16 @@ def test_unknown_is_other_and_schema_types_map():
     assert schema_type_category(["ComedyEvent"]) == "Comedy"
     assert schema_type_category(["https://schema.org/TheaterEvent"]) == "Theatre"
     assert schema_type_category(["Event"]) is None
+
+
+# Rows from a real Mumbai run that the platforms' own categories got wrong
+@pytest.mark.parametrize("categories, title, venue, expected", [
+    (["Music"], "Raas Rang Ghatkopar", "Police Hockey Ground, Ghatkopar East", "Culture"),
+    (["Music"], "Showglitz Events Navratri 2026 Ft. Geeta Rabari", "", "Culture"),
+    (["Culture"], "Duos ft. Prashasti Singh & Atul Khatri: KCC", "Khar Comedy Club: Mumbai", "Comedy"),
+    (["shooting"], "The Rising Gun Shooting Range", "The Rising Gun Shooting Academy", "Recreational Sports"),
+    (["Culture"], "OktoberFest by Mumbai Meri Jaan", "MMRDA Grounds", "F&B"),
+    (["Workshops"], "AZAD CRICKET COACHING CENTRE MUMBAI OUTDOOR CRICKET TRAINING CAMP 2026", "", "Recreational Sports"),
+])
+def test_priority_rules_fix_misleading_categories(categories, title, venue, expected):
+    assert classify_activity(categories, title, "", venue) == expected

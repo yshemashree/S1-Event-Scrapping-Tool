@@ -131,6 +131,21 @@ _RULES: List[Tuple[str, "re.Pattern[str]"]] = [
     )),
 ]
 
+# Checked before everything else (on title, venue and categories): cases where a
+# platform's own category or a generic word misleads, e.g. a Navratri night filed
+# under "Music", a shooting range or a comedy club gig with no "comedy" in its name.
+_PRIORITY_RULES: List[Tuple[str, "re.Pattern[str]"]] = [
+    ("Culture", _rx(r"navratri", r"garba", r"dandiya", r"raas", r"ram ?leela")),
+    ("Comedy", _rx(r"comedy club", r"comedy store", r"laugh store")),
+    ("F&B", _rx(r"oktober ?fest", r"octoberfest", r"beer fest(?:ival)?", r"food fest(?:ival)?")),
+    ("Recreational Sports", _rx(
+        r"shooting range", r"shooting academy", r"archery", r"go-?karting", r"paintball",
+        r"(?:cricket|football|tennis|badminton|swimming|skating) (?:coaching|training|camp|academy)",
+        r"coaching (?:camp|centre|center)", r"training camp",
+    )),
+]
+
+
 # schema.org Event subtypes map straight onto categories
 _SCHEMA_TYPES = {
     "comedyevent": "Comedy", "musicevent": "Music", "theaterevent": "Theatre",
@@ -168,9 +183,12 @@ def _first_rule(text: str, rules: Sequence[Tuple[str, "re.Pattern[str]"]] = _RUL
     return None
 
 
-def classify_activity(categories: Sequence[str], title: str = "", description: str = "") -> str:
+def classify_activity(categories: Sequence[str], title: str = "", description: str = "", venue: str = "") -> str:
     """Pick the Activity Type: platform categories, then title, then weak labels, then description."""
     cats = " | ".join(c for c in categories if c)
+    found = _first_rule(" | ".join((title, venue, cats)), _PRIORITY_RULES)
+    if found:
+        return found
     for text in (cats, title):
         found = _first_rule(text)
         if found:

@@ -4,7 +4,7 @@ import time
 import pytest
 
 from fakesites import FakeSite, FakeWeb
-from s1scraper.fetcher import Cancelled, Fetcher, HttpCache, Politeness, RobotsRules, looks_blocked
+from s1scraper.fetcher import Cancelled, FetchResult, Fetcher, HttpCache, Politeness, RobotsRules, looks_blocked
 
 
 def make(site_routes, **politeness):
@@ -40,6 +40,9 @@ def test_looks_blocked():
     assert looks_blocked(200, "<script src='/cdn-cgi/challenge-platform/x'></script>" + "x" * 100000)
     assert not looks_blocked(200, "<html>" + "real event page about access denied " * 2000 + "</html>")
     assert not looks_blocked(404, "<h1>Not found</h1>")
+    # an app shell that asks for JavaScript is a normal page, not a refusal (SortMyScene was switched off by it)
+    assert not looks_blocked(200, "<html><noscript>Please enable JavaScript and cookies to continue</noscript>"
+                                  "<div id=root></div></html>")
 
 
 def test_pacing_between_requests_to_one_site():
@@ -49,6 +52,30 @@ def test_pacing_between_requests_to_one_site():
         assert f.get("https://example.test/a", cache_hours=0).ok
         assert f.get("https://example.test/b", cache_hours=0).ok
         assert time.monotonic() - t0 >= 0.4
+    finally:
+        site.stop()
+
+
+def test_a_touchy_site_gets_its_own_wider_gap():
+    site, f = make({"/a": (200, "text/html", "ok"), "/b": (200, "text/html", "ok")}, min_delay=0.01, max_delay=0.01)
+    try:
+        f.set_host_pacing("example.test", 0.4, 0.4)            # BookMyShow-style floor
+        t0 = time.monotonic()
+        assert f.get("https://example.test/a", cache_hours=0).ok
+        assert f.get("https://example.test/b", cache_hours=0).ok
+        assert time.monotonic() - t0 >= 0.4
+    finally:
+        site.stop()
+
+
+def test_cookies_can_be_forgotten_per_site():
+    site, f = make({"/a": (200, "text/html", "ok")})
+    try:
+        assert f.get("https://example.test/a", cache_hours=0).ok
+        session = f.host_state("example.test").session
+        session.cookies.set("Rgn", "MUMBAI", domain="example.test")   # a remembered city
+        f.reset_cookies("example.test")
+        assert len(session.cookies) == 0
     finally:
         site.stop()
 
@@ -79,6 +106,21 @@ def test_circuit_breaker_stops_contacting_a_refusing_site():
         assert res.blocked and "stopped contacting" in res.error
         assert site.hits.get("/x", 0) == hits_before          # no further network traffic
         assert f.is_disabled("example.test")
+    finally:
+        site.stop()
+
+
+def test_browser_refusals_do_not_stop_normal_downloads():
+    """BookMyShow turns away the automated browser but still serves normal page downloads."""
+    from s1scraper.fetcher import browser_key
+
+    site, f = make({"/list": (200, "text/html", "<html>listing</html>")}, max_consecutive_blocks=3)
+    try:
+        for _ in range(3):
+            f.note_block(browser_key("example.test"), " (in the browser)")
+        assert "stopped using the browser" in f.is_disabled(browser_key("example.test"))
+        assert not f.is_disabled("example.test")
+        assert f.get("https://example.test/list", cache_hours=0).ok
     finally:
         site.stop()
 
@@ -164,3 +206,34 @@ def test_unreachable_site_is_skipped_after_two_pages():
     t0 = time.monotonic()
     res = f.get("https://down.test/c", cache_hours=0)
     assert res.blocked and time.monotonic() - t0 < 0.5
+
+
+def test_a_cache_file_swapped_out_mid_run_never_stops_the_run(tmp_path):
+    import os
+
+    path = tmp_path / "cache" / "http_cache.sqlite3"
+    cache = HttpCache(path)
+    page = lambda n: FetchResult(f"https://x.test/{n}", f"https://x.test/{n}", 200, f"page {n}")  # noqa: E731
+    cache.put(page(1))
+    os.remove(path)                        # what a synced Desktop folder can do to an open file
+    cache.put(page(2))                     # must not raise
+    cache.put(page(3))
+    assert cache.get("https://x.test/3", 3600).text == "page 3" and not cache.problem
+    cache.close()
+
+
+def test_a_cache_that_cannot_be_reopened_is_simply_skipped(tmp_path, monkeypatch):
+    import sqlite3
+
+    cache = HttpCache(tmp_path / "c.sqlite3")
+    page = FetchResult("https://x.test/1", "https://x.test/1", 200, "page 1")
+
+    def broken(*a, **kw):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(cache, "_open", broken)
+    cache.conn.close()                     # every statement now fails
+    cache.put(page)
+    cache.put(page)
+    assert cache.get("https://x.test/1", 3600) is None
+    assert "readonly" in cache.problem or "closed" in cache.problem

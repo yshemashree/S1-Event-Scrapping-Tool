@@ -36,6 +36,7 @@ class AllEvents(Source):
     )
     event_pattern = r"^https?://allevents\.in/[a-z0-9-]+/[^/?#]+/\d{6,}"
     id_pattern = r"/(\d{6,})(?:[/?#]|$)"
+    url_city_pattern = r"^https?://allevents\.in/([a-z0-9-]+)/"   # its Mumbai list also shows Mehsana etc.
     max_listing_pages = 10
 
 
@@ -115,6 +116,7 @@ class Meetup(Source):
     id_pattern = r"/events/(\d+)"
     max_listing_pages = 2
     listing_browser = "always"
+    listing_scrolls = 10             # its feed scrolls without end; ten screens cover the next weeks
 
 
 class Explara(Source):

@@ -35,6 +35,13 @@ def test_cli_arguments_map_onto_settings():
     assert (s.window_preset, s.window_start, s.window_end) == (CUSTOM, "2026-10-10", "2026-12-31")
     with pytest.raises(SettingsError):
         apply_args(Settings(), args("--sources", "nosuchsite"))
+    assert Settings().time_limit_minutes == 60
+    a = args("--sources", "district", "--dry-run", "--save-pages", "--find", "Sunidhi Chauhan", "A R Rahman")
+    assert a.dry_run and a.save_pages and a.find == ["Sunidhi Chauhan", "A R Rahman"]
+    assert apply_args(Settings(), args("--time-limit", "90")).time_limit_minutes == 90
+    assert apply_args(Settings(), args("--max-minutes", "0")).time_limit_minutes == 0
+    with pytest.raises(SettingsError):
+        apply_args(Settings(), args("--time-limit", "-5"))
 
 
 def test_settings_round_trip_and_new_sources_default_on(tmp_path):
@@ -58,4 +65,15 @@ def test_validation():
         Settings(sources={k: False for k in SOURCE_BY_KEY}).validate()
     with pytest.raises(SettingsError):
         Settings(workbook_path="calendar.csv").validate()
+    with pytest.raises(SettingsError):
+        Settings(time_limit_minutes="soon").validate()
     Settings().validate()
+
+
+def test_the_browser_never_shows_from_saved_settings(tmp_path):
+    path = tmp_path / "settings.json"
+    s = Settings()
+    s.show_browser = True                       # what an older version could save from the app
+    s.save(path)
+    assert Settings.load(path).show_browser is False
+    assert apply_args(Settings.load(path), args("--show-browser")).show_browser is True   # one run, on request

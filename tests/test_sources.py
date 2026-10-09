@@ -39,6 +39,10 @@ def test_bookmyshow_seeds_and_follow_pages():
     assert any(rx.search("https://in.bookmyshow.com/explore/comedy-shows-mumbai") for rx in follow)
     assert not any(rx.search("https://in.bookmyshow.com/explore/movies-mumbai") for rx in follow)
     assert not any(rx.search("https://in.bookmyshow.com/explore/comedy-shows-pune") for rx in follow)
+    # more pages of the same list yes, its endless filter combinations no
+    assert any(rx.search("https://in.bookmyshow.com/explore/comedy-shows-mumbai?page=2") for rx in follow)
+    assert not any(rx.search("https://in.bookmyshow.com/explore/events-mumbai?daygroups=today&languages=hindi")
+                   for rx in follow)
 
 
 @pytest.mark.parametrize("url, ok", [
@@ -46,6 +50,9 @@ def test_bookmyshow_seeds_and_follow_pages():
     ("https://www.district.in/events/saturday-comedy-night-jul18-2026-buy-tickets", True),
     ("https://www.district.in/events/sunburn-union-local-artists-collective-feb15-2025", True),
     ("https://www.district.in/events/upcoming-events-in-pune", False),
+    ("https://www.district.in/events/music-in-mumbai-book-tickets", False),
+    ("https://www.district.in/events/sports-events-in-delhi-ncr-book-tickets", False),
+    ("https://www.district.in/events/karthik-live-in-bengaluru-exclusive-tamil-show-2026-buy-tickets", True),
     ("https://www.district.in/events/nightlife-this-weekend-in-mumbai", False),
     ("https://www.district.in/events/comedy-shows-in-mumbai", False),
     ("https://www.district.in/events/artist/some-artist", False),
@@ -86,3 +93,54 @@ def test_registry_is_consistent():
     assert platform_for_url("https://www.district.in/events/x") == "Zomato District"
     assert platform_for_url("https://insider.in/x/event") == "Zomato District"
     assert platform_for_url("https://example.com") == ""
+
+
+def test_a_city_spelling_that_works_is_tried_first_on_its_other_lists():
+    from datetime import date
+
+    from s1scraper.models import Event
+    from s1scraper.sources import RunContext
+    from s1scraper.sources.base import PageData
+
+    src = District()
+    asked = []
+
+    def load(ctx, url, seed=False):
+        asked.append(url)
+        ok = url.endswith(("-in-delhi", "-in-delhi-book-tickets"))      # District spells it "delhi" here
+        return PageData(url=url, final_url=url, status=200 if ok else 404, html="<html></html>" if ok else "")
+
+    src.load_listing = load
+    src.extract_listing = lambda ctx, page, city: [Event(url=page.url + "/x", title="X")]
+    ctx = RunContext(fetcher=None, browser=None, window_start=date(2026, 10, 9), window_end=date(2026, 11, 9),
+                     ref=date(2026, 10, 9))
+    src.follow_patterns = ()
+    src.discover(ctx, get_city("Delhi NCR"))
+    # the general page tries delhi-ncr, then delhi; every category list then starts with delhi
+    assert asked[:2] == ["https://www.district.in/events/upcoming-events-in-delhi-ncr",
+                         "https://www.district.in/events/upcoming-events-in-delhi"]
+    assert all("-in-delhi-book-tickets" in u for u in asked[2:]) and len(asked) == 2 + len(src.listing_templates) - 1
+
+
+def test_bookmyshow_city_lists_are_filled_in_by_the_browser():
+    from datetime import date
+    from types import SimpleNamespace
+
+    from s1scraper.browser import RenderResult
+    from s1scraper.fetcher import FetchResult
+    from s1scraper.sources import RunContext
+
+    links = "".join(f"<a href='/events/show-{i}/ET0041{i:04d}'>Show {i}</a>" for i in range(20))
+    html = f"<html><body>{links}</body></html>"
+    rendered = []
+    fetcher = SimpleNamespace(get=lambda url, kind="page": FetchResult(url, url, 200, html),
+                              is_disabled=lambda host: "")
+    browser = SimpleNamespace(available=lambda: True,
+                              render=lambda url, scroll=True, max_scrolls=None: rendered.append(url)
+                              or RenderResult(url=url, final_url=url, status=200, html=html))
+    ctx = RunContext(fetcher=fetcher, browser=browser, window_start=date(2026, 10, 9), window_end=date(2027, 4, 9),
+                     ref=date(2026, 10, 9))
+    bms = BookMyShow()
+    bms.load_listing(ctx, "https://in.bookmyshow.com/explore/events-pune", seed=True)
+    bms.load_listing(ctx, "https://in.bookmyshow.com/explore/comedy-shows-pune")     # a follow-on list
+    assert rendered == ["https://in.bookmyshow.com/explore/events-pune"]

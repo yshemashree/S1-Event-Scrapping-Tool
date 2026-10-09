@@ -60,10 +60,12 @@ class Politeness:
     detail_cache_hours: float = 240.0
 
 
+# Gaps between two requests to the SAME site. Different sites are read at the
+# same time, so a run takes about as long as its busiest site.
 SPEED_PRESETS: Dict[str, dict] = {
-    "gentle": dict(min_delay=3.0, max_delay=7.0, breather_every=30, breather_seconds=30.0),
-    "normal": dict(min_delay=1.5, max_delay=4.0, breather_every=40, breather_seconds=20.0),
-    "fast": dict(min_delay=0.8, max_delay=2.0, breather_every=60, breather_seconds=10.0),
+    "gentle": dict(min_delay=2.0, max_delay=4.5, breather_every=40, breather_seconds=15.0),
+    "normal": dict(min_delay=1.0, max_delay=2.5, breather_every=50, breather_seconds=8.0),
+    "fast": dict(min_delay=0.6, max_delay=1.4, breather_every=80, breather_seconds=5.0),
     # automated tests against local fake sites only
     "instant": dict(min_delay=0.0, max_delay=0.0, breather_every=0, breather_seconds=0.0, backoff_base=0.05),
 }
@@ -102,15 +104,34 @@ _WEAK_MARKERS = (
 )
 
 
+# Interstitial pages that can come back with status 200.
+_CHALLENGE_PAGE_MARKERS = (
+    "just a moment...", "attention required! | cloudflare", "checking your browser",
+    "please verify you are a human", "are you a robot", "request unsuccessful",
+)
+
+
+BROWSER_SUFFIX = "#browser"
+
+
+def browser_key(host: str) -> str:
+    """Refusals of the hidden browser are counted apart from plain downloads: sites
+    like BookMyShow turn away the automated browser while still serving normal requests."""
+    return host + BROWSER_SUFFIX
+
+
 def looks_blocked(status: int, text: str) -> bool:
     if status in (401, 403, 429):
         return True
     low = (text or "")[:60000].lower()
     if any(m in low for m in _STRONG_MARKERS):
         return True
-    if len(text or "") < 25000 and any(m in low for m in _WEAK_MARKERS):
+    size = len(text or "")
+    if status >= 400 and size < 25000 and any(m in low for m in _WEAK_MARKERS):
         return True
-    return False
+    # On a normal (200) answer only a tiny challenge page counts: an app shell that merely says
+    # "enable JavaScript" (SortMyScene's home page) is not a refusal.
+    return status < 400 and size < 8000 and any(m in low for m in _CHALLENGE_PAGE_MARKERS)
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -183,27 +204,63 @@ class RobotsRules:
 # ------------------------------------------------------------------- disk cache
 
 class HttpCache:
-    """Small sqlite cache of page bodies, safe to share between threads."""
+    """Small sqlite cache of page bodies, safe to share between threads.
+
+    A cache problem never stops a run. If the file stops accepting writes (it was moved or replaced
+    while open, for example by a cloud-synced folder), it is reopened once; if that fails too, the run
+    carries on without the cache and ``problem`` says why."""
 
     def __init__(self, path: Optional[Path]):
         self.lock = threading.Lock()
         self.conn = None
+        self.path = path
+        self.problem = ""
+        self._reopened = False
         if path is not None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self.conn = sqlite3.connect(str(path), check_same_thread=False)
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS pages (url TEXT PRIMARY KEY, final_url TEXT, status INTEGER,"
-                " fetched REAL, ctype TEXT, body BLOB)"
-            )
-            self.conn.commit()
+            try:
+                self._open()
+            except (sqlite3.Error, OSError) as exc:
+                self._trouble(exc, reopen=False)
+
+    def _open(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30)
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS pages (url TEXT PRIMARY KEY, final_url TEXT, status INTEGER,"
+            " fetched REAL, ctype TEXT, body BLOB)"
+        )
+        self.conn.commit()
+
+    def _trouble(self, exc: Exception, reopen: bool = True) -> None:
+        """Called with the lock held (or before the cache is shared)."""
+        log.warning("Page cache problem: %s", exc)
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except sqlite3.Error:
+            pass
+        self.conn = None
+        if reopen and not self._reopened and self.path is not None:
+            self._reopened = True
+            try:
+                self._open()
+                return
+            except (sqlite3.Error, OSError) as again:
+                exc = again
+                self.conn = None
+        self.problem = f"the page cache could not be used ({exc}), so pages were downloaded fresh"
 
     def get(self, url: str, max_age_s: float) -> Optional[FetchResult]:
         if self.conn is None or max_age_s <= 0:
             return None
         with self.lock:
-            row = self.conn.execute(
-                "SELECT final_url, status, fetched, ctype, body FROM pages WHERE url = ?", (url,)
-            ).fetchone()
+            try:
+                row = self.conn.execute(
+                    "SELECT final_url, status, fetched, ctype, body FROM pages WHERE url = ?", (url,)
+                ).fetchone() if self.conn is not None else None
+            except sqlite3.Error as exc:
+                self._trouble(exc)
+                return None
         if not row or time.time() - row[2] > max_age_s:
             return None
         try:
@@ -217,23 +274,35 @@ class HttpCache:
             return
         body = zlib.compress(res.text.encode("utf-8"), 6)
         with self.lock:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?, ?, ?)",
-                (res.url, res.final_url, res.status, time.time(), res.content_type, body),
-            )
-            self.conn.commit()
+            if self.conn is None:
+                return
+            try:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?, ?, ?)",
+                    (res.url, res.final_url, res.status, time.time(), res.content_type, body),
+                )
+                self.conn.commit()
+            except sqlite3.Error as exc:
+                self._trouble(exc)
 
     def prune(self, older_than_days: float = 30) -> None:
         if self.conn is None:
             return
         with self.lock:
-            self.conn.execute("DELETE FROM pages WHERE fetched < ?", (time.time() - older_than_days * 86400,))
-            self.conn.commit()
+            try:
+                self.conn.execute("DELETE FROM pages WHERE fetched < ?",
+                                  (time.time() - older_than_days * 86400,))
+                self.conn.commit()
+            except sqlite3.Error as exc:
+                self._trouble(exc)
 
     def close(self) -> None:
-        if self.conn is not None:
-            with self.lock:
-                self.conn.close()
+        with self.lock:
+            if self.conn is not None:
+                try:
+                    self.conn.close()
+                except sqlite3.Error:
+                    pass
                 self.conn = None
 
 
@@ -266,6 +335,17 @@ class Fetcher:
         self.unrewrite = unrewrite or (lambda u: u)
         self._hosts: Dict[str, _HostState] = {}
         self._hosts_lock = threading.Lock()
+        self._host_pacing: Dict[str, Tuple[float, float]] = {}
+
+    def set_host_pacing(self, host: str, min_delay: float, max_delay: float) -> None:
+        """A wider gap for one site than the speed setting gives (sites that are quick to refuse)."""
+        self._host_pacing[host.lower()] = (min_delay, max_delay)
+
+    def reset_cookies(self, host: str) -> None:
+        """Forget a site's cookies, e.g. a remembered city that would colour the next city's pages."""
+        st = self.host_state(host.lower())
+        if st.session is not None:
+            st.session.cookies.clear()
 
     # ---------------------------------------------------------- host state
     def host_state(self, host: str) -> _HostState:
@@ -285,10 +365,16 @@ class Fetcher:
         st.consecutive_blocks += 1
         st.stats["blocked"] += 1
         if st.consecutive_blocks >= self.p.max_consecutive_blocks and not st.disabled_reason:
-            st.disabled_reason = (
-                f"{host} refused {st.consecutive_blocks} requests in a row{where}; stopped contacting it "
-                "for the rest of this run to protect your IP. Try again in a few hours."
-            )
+            if host.endswith(BROWSER_SUFFIX):
+                st.disabled_reason = (
+                    f"{host[:-len(BROWSER_SUFFIX)]} refused the browser {st.consecutive_blocks} times in a row; "
+                    "stopped using the browser for it this run (normal downloads carry on)."
+                )
+            else:
+                st.disabled_reason = (
+                    f"{host} refused {st.consecutive_blocks} requests in a row{where}; stopped contacting it "
+                    "for the rest of this run to protect your IP. Try again in a few hours."
+                )
             log.warning(st.disabled_reason)
             return True
         return bool(st.disabled_reason)
@@ -338,7 +424,11 @@ class Fetcher:
             yield
         finally:
             st.count += 1
-            delay = random.uniform(self.p.min_delay, self.p.max_delay)
+            lo, hi = self.p.min_delay, self.p.max_delay
+            floor = self._host_pacing.get(host.split("#", 1)[0])
+            if floor and self.p.max_delay > 0:            # tests run with no delay at all
+                lo, hi = max(lo, floor[0]), max(hi, floor[1])
+            delay = random.uniform(lo, hi)
             if self.p.breather_every and st.count % self.p.breather_every == 0:
                 delay += self.p.breather_seconds * random.uniform(0.8, 1.3)
             st.next_time = time.monotonic() + delay

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from bs4 import BeautifulSoup, FeatureNotFound, Tag
@@ -301,6 +301,84 @@ def _offers(offers: Any) -> Tuple[List[float], bool, bool, str, List[Tuple[str, 
     return prices, free, sold_out, url, types
 
 
+# ------------------------------------------------------------ register by
+
+REGISTER_KEYS = (
+    "registrationDeadline", "registration_deadline", "registrationEndDate", "registration_end_date",
+    "registrationEndTime", "registration_end_time", "registrationEnd", "registration_end",
+    "registrationClosesAt", "registration_closes_at", "registrationCloseDate", "registration_close_date",
+    "lastDateToRegister", "last_date_to_register", "rsvpCloseTime", "rsvp_close_time", "rsvpDeadline",
+    "rsvp_deadline", "saleEndTime", "sale_end_time", "saleEndDate", "sale_end_date", "salesEndDate",
+    "sales_end_date", "salesEnd", "sales_end", "ticketSaleEnd", "ticket_sale_end", "ticketSalesEnd",
+    "ticket_sales_end", "bookingEndTime", "booking_end_time", "bookingEndDate", "booking_end_date",
+    "bookingCloseDate", "booking_close_date", "registerBy", "register_by", "bookBy", "book_by",
+    "availabilityEnds", "validThrough",
+)
+
+
+def _deadline_value(v: Any, ref: Optional[date]) -> Optional[datetime]:
+    if v in (None, "", [], {}):
+        return None
+    if isinstance(v, str):
+        dt, _ = parse_datetime(v, ref)
+        if dt is None:
+            dt, _, _ = parse_date_range(v, ref)
+        return dt
+    dt, _ = _date_value(v, ref)
+    return dt
+
+
+def offer_deadline(offers: Any, ref: Optional[date] = None) -> Optional[datetime]:
+    """Latest "sales end" among schema.org offers (an early-bird tier ending sooner does not close
+    registration)."""
+    found: List[datetime] = []
+
+    def visit(o: Any) -> None:
+        if isinstance(o, list):
+            for x in o:
+                visit(x)
+        elif isinstance(o, dict):
+            for key in ("availabilityEnds", "validThrough"):
+                dt = _deadline_value(o.get(key), ref)
+                if dt is not None:
+                    found.append(dt)
+            if "offers" in o:
+                visit(o["offers"])
+
+    visit(offers)
+    return max(found) if found else None
+
+
+_REGISTER_TEXT_RES = [re.compile(p, re.I) for p in (
+    r"\b(?:registrations?|entries|enrol?l?ments?|bookings?|rsvps?|ticket sales|sales|applications?)\s+"
+    r"(?:will\s+)?(?:close|closes|closing|end|ends|ending|shut|shuts)\s*(?:on|by|at)?\s*[:\-–]?\s*(?P<d>.{4,60})",
+    r"\b(?:last|final)\s+date\s+(?:to|for|of)\s+(?:register|registration|registrations|apply|application|"
+    r"booking|book|enrol\w*|submission|entry|entries)\s*(?:is|:|\-|–)?\s*(?P<d>.{4,60})",
+    r"\b(?:register|book|rsvp|apply|enrol\w*|sign up)\s+(?:before|by|latest by|no later than|on or before)\s*:?\s*"
+    r"(?P<d>.{4,60})",
+    r"\b(?:registration|booking|rsvp|application)\s+deadline\s*(?:is|:|\-|–)?\s*(?P<d>.{4,60})",
+)]
+
+
+def register_by_from_text(lines: Sequence[str], ref: Optional[date] = None) -> Optional[datetime]:
+    """A registration deadline written on the page ("Registrations close on 10 Oct",
+    "Last date to register: 10/10/2026"). None unless the sentence carries a real date."""
+    for line in lines[:500]:
+        if len(line) > 300:
+            continue
+        for rx in _REGISTER_TEXT_RES:
+            m = rx.search(line)
+            if not m:
+                continue
+            text = m.group("d")
+            if not re.search(r"\d", text):
+                continue
+            dt, _, _ = parse_date_range(text, ref)
+            if dt is not None:
+                return dt
+    return None
+
+
 def event_from_jsonld(d: Dict[str, Any], page_url: str, ref: Optional[date] = None) -> Event:
     ev = Event()
     ev.title = clean_title(_first_str(d.get("name")) or _first_str(d.get("headline")))
@@ -313,6 +391,7 @@ def event_from_jsonld(d: Dict[str, Any], page_url: str, ref: Optional[date] = No
     if not ev.online and "online" in _first_str(d.get("eventAttendanceMode")).lower():
         ev.online = True
     prices, free, sold_out, ticket_url, types = _offers(d.get("offers"))
+    ev.register_by = offer_deadline(d.get("offers"), ref) or _deadline_value(_get(d, REGISTER_KEYS[:-2]), ref)
     if prices:
         ev.price_min, ev.price_max = min(prices), max(prices)
         if len(set(prices)) == 1 and not types:
@@ -782,6 +861,7 @@ class EventWalker:
                 ev.price_max = None
         if free:
             ev.is_free, ev.price_min = True, 0.0
+        ev.register_by = _deadline_value(_get(d, REGISTER_KEYS), self.ref) or offer_deadline(d.get("offers"), self.ref)
         ev.organizer = _clean_organizer(_names(_get(d, ORG_KEYS)))
         cats: List[str] = []
         for k in CAT_KEYS:

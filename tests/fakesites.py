@@ -147,6 +147,10 @@ def build_bookmyshow(today: date) -> FakeSite:
         {"eventCode": "ET00410009", "title": "New Year's Eve Gala 2027", "slug": "nye-gala-2027",
          "venueName": "Taj Lands End: Mumbai", "displayDate": f"{d(120):%a, %d %b %Y}", "price": "₹ 8,000 onwards",
          "category": "Parties"},
+        # a play that BookMyShow also shows in the events grid: its page exists only under /plays/
+        {"eventCode": "ET00410012", "title": "Hi Dosti Tutaychi Naay", "slug": "hi-dosti-tutaychi-naay",
+         "venueName": "Shivaji Mandir: Dadar, Mumbai", "displayDate": f"{d(7):%a, %d %b}", "price": "₹ 399 onwards",
+         "category": "Drama"},
     ]
     state = {"explore": {"listings": [{"type": "grid", "data": mumbai_cards}],
                          "filters": [{"name": "Comedy", "url": "/explore/comedy-shows-mumbai"}]}}
@@ -173,10 +177,26 @@ def build_bookmyshow(today: date) -> FakeSite:
         f"<a href='/events/aakash-gupta-live/ET00410001'><div class='card'><h3>Aakash Gupta Live</h3>"
         f"<div>{d(2):%a, %d %b}</div><div>St. Andrew's Auditorium: Mumbai</div><div>₹ 999 onwards</div></div></a>"
         "</div>"))
+    plays_state = {"explore": {"listings": [{"type": "grid", "data": [
+        {"eventCode": "ET00410011", "title": "Ek Tichi Goshta", "slug": "ek-tichi-goshta",
+         "venueName": "Yashwant Natya Mandir: Mumbai", "displayDate": f"{d(3):%a, %d %b}", "price": "₹ 300 onwards",
+         "category": "Drama"}]}]}}
     s.page("/explore/plays-mumbai", page(
         "Plays in Mumbai | BookMyShow",
         f"<a href='/plays/aadhe-adhure/ET00410007'><div><h3>Aadhe Adhure</h3><div>{d(4):%d %b} - {d(5):%d %b}</div>"
-        "<div>Prithvi Theatre: Mumbai</div><div>₹ 400 onwards</div></div></a>"))
+        "<div>Prithvi Theatre: Mumbai</div><div>₹ 400 onwards</div></div></a>"
+        f"<script>window.__INITIAL_STATE__ = {json.dumps(plays_state)};</script>"))
+    for code, slug, title, day in (("ET00410011", "ek-tichi-goshta", "Ek Tichi Goshta", 3),
+                                   ("ET00410012", "hi-dosti-tutaychi-naay", "Hi Dosti Tutaychi Naay", 7)):
+        s.page(f"/plays/{slug}/{code}", page(
+            f"{title} | BookMyShow", f"<h1>{title}</h1><div>Drama | Marathi | 2hrs 30mins</div>",
+            head=ld({"@context": "https://schema.org", "@type": "TheaterEvent", "name": title,
+                     "url": f"https://in.bookmyshow.com/plays/{slug}/{code}",
+                     "startDate": iso(d(day), 19, 30),
+                     "location": {"@type": "Place", "name": "Shivaji Mandir",
+                                  "address": {"@type": "PostalAddress", "addressLocality": "Mumbai"}},
+                     "offers": {"@type": "Offer", "price": "399", "priceCurrency": "INR"},
+                     "description": "A Marathi comedy play about friendship and family."})))
     s.page("/explore/sports-mumbai", page("Sports in Mumbai | BookMyShow", "<p>No events right now</p>"))
 
     s.page("/events/aakash-gupta-live/ET00410001", page(
@@ -195,7 +215,7 @@ def build_bookmyshow(today: date) -> FakeSite:
                                           "postalCode": "400050", "addressCountry": "IN"}},
                  "offers": {"@type": "AggregateOffer", "lowPrice": "999", "highPrice": "2499", "priceCurrency": "INR",
                             "url": "https://in.bookmyshow.com/events/aakash-gupta-live/ET00410001",
-                            "availability": "https://schema.org/InStock"},
+                            "availability": "https://schema.org/InStock", "validThrough": iso(d(2), 23)},
                  "performer": [{"@type": "Person", "name": "Aakash Gupta"}],
                  "organizer": {"@type": "Organization", "name": "OML Entertainment"},
                  "description": "<p>Aakash Gupta is back with an all new hour of stand-up.</p>"})))
@@ -219,8 +239,10 @@ def build_bookmyshow(today: date) -> FakeSite:
         head=ld({"@context": "https://schema.org", "@type": "FoodEvent", "name": "Mumbai Food Truck Festival",
                  "startDate": d(15).isoformat(), "endDate": d(17).isoformat(),
                  "location": {"@type": "Place", "name": "Jio World Garden", "address": "BKC, Mumbai"},
-                 "offers": [{"@type": "Offer", "name": "Day Pass", "price": "299", "priceCurrency": "INR"},
-                            {"@type": "Offer", "name": "3-Day Pass", "price": "699", "priceCurrency": "INR"}]})))
+                 "offers": [{"@type": "Offer", "name": "Day Pass", "price": "299", "priceCurrency": "INR",
+                             "availabilityEnds": iso(d(13), 23, 59)},
+                            {"@type": "Offer", "name": "3-Day Pass", "price": "699", "priceCurrency": "INR",
+                             "availabilityEnds": iso(d(10), 23, 59)}]})))
     s.page("/events/rahul-dua-allow-me/ET00410005", page(
         "Rahul Dua – ALLOW ME | BookMyShow", "<h1>Rahul Dua – ALLOW ME</h1>",
         head=ld([{"@context": "https://schema.org", "@type": "Event", "name": "Rahul Dua – ALLOW ME",
@@ -325,6 +347,8 @@ def build_district(today: date) -> FakeSite:
                         for e in events[:1])
         return page(title, f"<h1>{title}</h1>{cards}<a href='/events/comedy-shows-in-mumbai'>Comedy</a>"
                            "<a href='/events/upcoming-events-in-pune'>Pune</a>"
+                           "<a href='/events/navratri-in-mumbai-book-tickets'>Navratri</a>"
+                           "<a href='/events/music-this-weekend-in-mumbai'>This weekend</a>"
                            f"<script id='__NEXT_DATA__' type='application/json'>{json.dumps(data)}</script>")
 
     mumbai = [
@@ -338,8 +362,39 @@ def build_district(today: date) -> FakeSite:
         {"id": 103, "title": "Sunday Gourmet Brunch", "slug": "sunday-gourmet-brunch-mumbai-buy-tickets",
          "startTime": epoch_ms(d(5), 12, 30), "venue": {"name": "Taj Mahal Palace", "city": "Mumbai"},
          "priceDisplayString": "₹5,500", "category": "Food & Drinks"},
+        {"id": 104, "title": "Bollywood Night at Kitty Su", "slug": "bollywood-night-kitty-su-buy-tickets",
+         "startTime": epoch_ms(d(6), 22), "endTime": epoch_ms(d(7), 2), "venue": {"name": "Kitty Su", "city": "Mumbai"},
+         "priceDisplayString": "₹1,500", "category": "Nightlife"},
     ]
     s.page("/events/upcoming-events-in-mumbai", next_page("Artists in your District", mumbai))
+    # The general page only shows the next few days; big concerts further out sit on the category lists
+    rahman = {"id": 105, "title": "A.R. Rahman - The Wonderment Tour", "slug": "ar-rahman-the-wonderment-tour-mumbai-"
+              f"{d(24):%b%d-%Y}".lower() + "-buy-tickets", "startTime": epoch_ms(d(24), 19),
+              "venue": {"name": "Jio World Garden", "city": "Mumbai"}, "priceDisplayString": "₹2,500 onwards",
+              "category": "Music"}
+    s.page("/events/music-in-mumbai-book-tickets", next_page("Music in Mumbai", [mumbai[0], rahman]))
+    garba = {"id": 106, "title": "Dandiya Dhamaal Mumbai", "slug": "dandiya-dhamaal-mumbai-buy-tickets",
+             "startTime": epoch_ms(d(3), 19), "venue": {"name": "NESCO Grounds", "city": "Mumbai"},
+             "priceDisplayString": "₹799", "category": "Navratri"}
+    s.page("/events/navratri-in-mumbai-book-tickets", next_page("Navratri in Mumbai", [garba]))
+    weekend = {"id": 107, "title": "Weekend Slice Gig", "slug": "weekend-slice-gig-buy-tickets",
+               "startTime": epoch_ms(d(2), 21), "venue": {"name": "Antisocial", "city": "Mumbai"},
+               "priceDisplayString": "₹499", "category": "Music"}
+    s.page("/events/music-this-weekend-in-mumbai", next_page("Music this weekend", [weekend]))
+    s.page(f"/events/{rahman['slug']}", page(
+        "A.R. Rahman - The Wonderment Tour | District", "<h1>A.R. Rahman - The Wonderment Tour</h1>",
+        head=ld({"@context": "https://schema.org", "@type": "MusicEvent", "name": "A.R. Rahman - The Wonderment Tour",
+                 "startDate": iso(d(24), 19), "location": {"@type": "Place", "name": "Jio World Garden",
+                                                           "address": "G Block, BKC, Mumbai"},
+                 "offers": {"@type": "AggregateOffer", "lowPrice": "2500", "highPrice": "25000", "priceCurrency": "INR"},
+                 "organizer": {"@type": "Organization", "name": "BookMyShow Live"},
+                 "description": "A. R. Rahman brings The Wonderment Tour to Mumbai for one night."})))
+    s.page(f"/events/{garba['slug']}", page(
+        "Dandiya Dhamaal Mumbai | District", "<h1>Dandiya Dhamaal Mumbai</h1>",
+        head=ld({"@context": "https://schema.org", "@type": "Event", "name": "Dandiya Dhamaal Mumbai",
+                 "startDate": iso(d(3), 19), "location": {"@type": "Place", "name": "NESCO Grounds",
+                                                          "address": "Goregaon East, Mumbai"},
+                 "offers": {"@type": "Offer", "price": "799", "priceCurrency": "INR"}})))
     s.page("/events/comedy-shows-in-mumbai", next_page("Comedy in Mumbai", []))
     s.page("/events/upcoming-events-in-pune", next_page("Artists in your District", []))
     # the first Delhi spelling does not exist; the scraper must fall back to the next
@@ -374,6 +429,14 @@ def build_district(today: date) -> FakeSite:
                  "startDate": iso(d(5), 12, 30), "location": {"@type": "Place", "name": "Taj Mahal Palace",
                                                               "address": "Apollo Bunder, Colaba, Mumbai"},
                  "offers": {"@type": "Offer", "price": "5500", "priceCurrency": "INR"}})))
+    s.page(f"/events/{mumbai[3]['slug']}", page(
+        "Bollywood Night at Kitty Su | District",
+        "<h1>Bollywood Night at Kitty Su</h1><p>The biggest Bollywood party of the month.</p>"
+        f"<p>Registrations close on {d(5):%d %b %Y}</p>",
+        head=ld({"@context": "https://schema.org", "@type": "Event", "name": "Bollywood Night at Kitty Su",
+                 "startDate": iso(d(6), 22), "endDate": iso(d(7), 2),
+                 "location": {"@type": "Place", "name": "Kitty Su", "address": "The Lalit, Andheri East, Mumbai"},
+                 "offers": {"@type": "Offer", "price": "1500", "priceCurrency": "INR"}})))
     s.page(f"/events/{delhi[0]['slug']}", page(
         "Delhi Wine & Cheese Soirée | District", "<h1>Delhi Wine & Cheese Soirée</h1>",
         head=ld({"@context": "https://schema.org", "@type": "Event", "name": "Delhi Wine & Cheese Soirée",
@@ -397,11 +460,32 @@ def build_allevents(today: date) -> FakeSite:
         {"@type": "Event", "name": "Online Python Bootcamp", "startDate": iso(d(8), 18),
          "url": "https://allevents.in/kolkata/online-python-bootcamp/80001234999",
          "location": {"@type": "VirtualLocation", "url": "https://zoom.us/j/1"}, "eventAttendanceMode": "OnlineEventAttendanceMode"},
+        # a weekly walk listed with its first date long ago and its last date far ahead
+        {"@type": "Event", "name": "Weekly Kolkata Heritage Walk", "startDate": iso(d(-200), 7),
+         "endDate": iso(d(200), 9), "url": "https://allevents.in/kolkata/weekly-kolkata-heritage-walk/80001235000",
+         "location": {"@type": "Place", "name": "Dalhousie Square", "address": "BBD Bagh, Kolkata"}},
+        # a season of walks starting in the window: its last date is not trustworthy
+        {"@type": "Event", "name": "Kolkata Food Walks Season", "startDate": iso(d(3), 8),
+         "endDate": iso(d(150), 10), "url": "https://allevents.in/kolkata/kolkata-food-walks-season/80001235001",
+         "location": {"@type": "Place", "name": "New Market", "address": "Lindsay Street, Kolkata"}},
     ]
-    s.page("/kolkata/all", page("Events in Kolkata | AllEvents", "<h1>Events in Kolkata</h1>",
-                                head=ld({"@context": "https://schema.org", "@type": "ItemList",
-                                         "itemListElement": [{"@type": "ListItem", "position": i + 1, "item": it}
-                                                             for i, it in enumerate(items)]})))
+    page_two = [
+        # complete on the listing: no event page needs to be opened
+        {"@type": "Event", "name": "Kolkata Jazz Evening", "startDate": iso(d(9), 19),
+         "url": "https://allevents.in/kolkata/kolkata-jazz-evening/80001235003",
+         "location": {"@type": "Place", "name": "The Park", "address": "Park Street, Kolkata"},
+         "offers": {"@type": "Offer", "price": "500", "priceCurrency": "INR"},
+         "organizer": {"@type": "Organization", "name": "Calcutta Jazz Club"},
+         "description": "An evening of live jazz standards with the city's best quartet."},
+    ]
+    first = page("Events in Kolkata | AllEvents", "<h1>Events in Kolkata</h1><a href='/kolkata/all?page=2'>Next page</a>",
+                 head=ld({"@context": "https://schema.org", "@type": "ItemList",
+                          "itemListElement": [{"@type": "ListItem", "position": i + 1, "item": it}
+                                              for i, it in enumerate(items)]}))
+    second = page("Events in Kolkata - page 2 | AllEvents", "<h1>Events in Kolkata</h1>",
+                  head=ld({"@context": "https://schema.org", "@type": "ItemList",
+                           "itemListElement": [{"@type": "ListItem", "position": 1, "item": it} for it in page_two]}))
+    s.routes["/kolkata/all"] = lambda q: (200, "text/html", second if q.get("page") == ["2"] else first)
     s.page("/kolkata/kolkata-literary-meet-2026/80001234567", page(
         "Kolkata Literary Meet 2026 | AllEvents",
         "<h1>Kolkata Literary Meet 2026</h1><div>Hosted by</div><div>Kolkata Lit Society</div>",
@@ -416,7 +500,12 @@ def build_allevents(today: date) -> FakeSite:
                                        "startDate": iso(d(2), 20),
                                        "url": "https://allevents.in/mumbai/aakash-gupta-live-in-mumbai/80009876543",
                                        "location": {"@type": "Place", "name": "St Andrews Auditorium",
-                                                    "address": "Bandra West, Mumbai"}}}]})))
+                                                    "address": "Bandra West, Mumbai"}}},
+                                   {"@type": "ListItem", "position": 2, "item": {
+                                       "@type": "Event", "name": "Rangtarang Garba Nights 2026",
+                                       "startDate": iso(d(3), 20),
+                                       "url": "https://allevents.in/mehsana/rangtarang-garba-nights-2026/80009183438727",
+                                       "location": {"@type": "Place", "name": "Bliss Aqua World Resort"}}}]})))
     s.page("/mumbai/aakash-gupta-live-in-mumbai/80009876543", page(
         "Aakash Gupta Live in Mumbai | AllEvents", "<h1>Aakash Gupta Live in Mumbai</h1>",
         head=ld({"@context": "https://schema.org", "@type": "Event", "name": "Aakash Gupta Live in Mumbai",

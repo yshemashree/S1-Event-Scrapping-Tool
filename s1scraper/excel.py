@@ -1,11 +1,14 @@
 """Write results into the StepOne workbook.
 
-* **Master** (maintained by StepOne) is append-only: existing rows and cells
-  are never changed. New events are added under a dated band after the last
-  row, and a hidden index remembers every event ever added, so an event is
-  never added twice - not even after its row was deleted by hand.
-* **Rolling Calendar** is rebuilt from scratch on every run for the chosen
-  window, in the Master's visual style, city by city, each city in date order.
+* **Master** (maintained by StepOne) is append-only: existing rows are never
+  edited. New events are added under a dated band after the last row, and a
+  hidden index remembers every event ever added, so an event is never added
+  twice - not even after its row was deleted by hand. The only layout change
+  is a one-time one StepOne asked for: the Ticket Platform(s) and Link
+  columns are removed and Register By sits beside Start Date.
+* **Rolling Calendar** (the client's sheet) is rebuilt from scratch on every
+  run for the chosen window, in the Master's visual style, city by city, each
+  city in date order. It leaves out prices, platforms and links.
 * A hidden append-only **Run Log**, and optional per-city tabs and a
   **Summary** sheet with live formulas (off by default: the client works
   from the Master and the Rolling Calendar only).
@@ -21,6 +24,7 @@ import os
 import re
 import shutil
 from collections import Counter
+from copy import copy
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -28,13 +32,14 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import MergedCell
+from openpyxl.utils import column_index_from_string, coordinate_to_tuple, get_column_letter, range_boundaries
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .cities import CITIES, detect_city, is_city_name
 from .classify import ACTIVITY_TYPES, TIER_UNKNOWN, TIERS
 from .models import Event
-from .normalize import format_price_range, title_tokens, titles_match
+from .normalize import format_price_range, now_ist, title_tokens, titles_match, xml_safe
 
 # ----------------------------------------------------------------- styling
 # Colours are taken from the reference workbook (Guide + Master Calander).
@@ -46,7 +51,7 @@ SUBTITLE_FILL = "FDF3DC"
 SUBTITLE_INK = "7A7A7A"
 HEADER_FILL = "3A3A3A"
 RUN_BAND_FILL = "0E4D45"
-LINK_INK = "0066CC"
+SOFT_INK = "8A8A8A"           # inferred values: Register By without a published deadline, "Multiple dates"
 GRID = "D9D9D9"
 
 CATEGORY_FILLS = {
@@ -64,25 +69,38 @@ CITY_BAND_FILLS = ["7D1A1A", "1B4F72", "4A235A", "145A32", "784212", "6E2C00", "
 
 DATE_FORMAT = "d mmm yyyy"
 
-# (header, width, horizontal alignment, wraps)
-COLUMNS: List[Tuple[str, float, str, bool]] = [
-    ("S.No.", 6, "center", False),
-    ("Event Name", 44, "left", True),
-    ("Activity Type", 15, "center", False),
-    ("Tier", 13, "center", False),
-    ("Start Date", 12, "center", False),
-    ("End Date", 12, "center", False),
-    ("City / Cities", 12, "left", False),
-    ("Venue", 34, "left", True),
-    ("Organizer", 26, "left", True),
-    ("Price Range", 17, "center", False),
-    ("Ticket Platform(s)", 20, "left", True),
-    ("Notes", 58, "left", True),
-    ("Region", 8, "center", False),
-    ("Link", 38, "left", False),
-    ("Added On", 11, "center", False),
-]
-HEADERS = [c[0] for c in COLUMNS]
+# Every column the scraper fills: header -> (width, horizontal alignment, wraps)
+FIELDS: Dict[str, Tuple[float, str, bool]] = {
+    "S.No.": (6, "center", False),
+    "Event Name": (44, "left", True),
+    "Activity Type": (15, "center", False),
+    "Tier": (13, "center", False),
+    "Register By": (12, "center", False),
+    "Start Date": (12, "center", False),
+    "End Date": (12, "center", False),
+    "City / Cities": (12, "left", False),
+    "Venue": (36, "left", True),
+    "Organizer": (28, "left", True),
+    "Price Range": (17, "center", False),
+    "Notes": (60, "left", True),
+    "Region": (8, "center", False),
+    "Added On": (11, "center", False),
+}
+# StepOne's call: the client's sheet shows no prices, ticket platforms or links. The Master keeps the
+# price range (the tier is worked out from it) but not the platforms or links either.
+MASTER_HEADERS = list(FIELDS)
+HEADERS = [h for h in MASTER_HEADERS if h != "Price Range"]
+COLUMNS: List[Tuple[str, float, str, bool]] = [(h, *FIELDS[h]) for h in HEADERS]   # the Rolling Calendar
+DROPPED_HEADERS = ("ticketplatforms", "ticketplatform", "link", "links")           # normalised, see _norm_header
+DATE_HEADERS = ("Register By", "Start Date", "End Date", "Added On")
+MULTIPLE_DATES = "Multiple dates"
+
+
+def col_letter(header: str) -> str:
+    """Column letter of a Rolling Calendar header (formulas follow the layout instead of fixed letters)."""
+    return get_column_letter(HEADERS.index(header) + 1)
+
+
 N_COLS = len(COLUMNS)
 LAST_COL = get_column_letter(N_COLS)
 
@@ -113,29 +131,40 @@ def _fill(color: str) -> PatternFill:
 
 # ------------------------------------------------------------ row content
 
-def event_row(ev: Event, serial: int, added_on: Optional[date]) -> List[object]:
+def event_row(ev: Event, serial: int, added_on: Optional[date], headers: Sequence[str] = HEADERS) -> List[object]:
+    values = event_values(ev, serial, added_on)
+    return [xml_safe(values[h]) if isinstance(values[h], str) else values[h] for h in headers]
+
+
+def event_values(ev: Event, serial: int, added_on: Optional[date]) -> Dict[str, object]:
     price = format_price_range(ev.price_min, ev.price_max, ev.is_free) or "TBC"
     venue = ev.venue or ("Online" if ev.online else "TBC")
     if ev.address and ev.venue and ev.city and ev.city.lower() not in venue.lower():
         locality = _locality(ev.address, ev.venue)
         venue = f"{venue}, {locality}" if locality else venue
-    return [
-        serial,
-        ev.title,
-        ev.activity_type or "Other",
-        ev.tier or TIER_UNKNOWN,
-        ev.start.date() if ev.start else (ev.date_text or "TBC"),
-        (ev.end or ev.start).date() if ev.start else (ev.date_text or "TBC"),
-        ev.city,
-        venue,
-        ev.organizer,
-        price,
-        " · ".join(ev.platforms or [ev.platform]),
-        ev.notes,
-        "India",
-        ev.buy_link,
-        added_on,
-    ]
+    if not ev.start:
+        end_value: object = ev.date_text or "TBC"
+    elif not ev.end_known:
+        end_value = MULTIPLE_DATES
+    else:
+        end_value = (ev.end or ev.start).date()
+    register_by = ev.register_by.date() if ev.register_by else (ev.start.date() if ev.start else None)
+    return {
+        "S.No.": serial,
+        "Event Name": ev.title,
+        "Activity Type": ev.activity_type or "Other",
+        "Tier": ev.tier or TIER_UNKNOWN,
+        "Register By": register_by,
+        "Start Date": ev.start.date() if ev.start else (ev.date_text or "TBC"),
+        "End Date": end_value,
+        "City / Cities": ev.city,
+        "Venue": venue,
+        "Organizer": ev.organizer,
+        "Price Range": price,
+        "Notes": ev.notes,
+        "Region": "India",
+        "Added On": added_on,
+    }
 
 
 _STATES = {"india", "maharashtra", "karnataka", "tamil nadu", "west bengal", "gujarat", "delhi", "haryana",
@@ -168,7 +197,7 @@ def _row_height(values: Sequence[object]) -> float:
 
 
 def style_event_row(ws: Worksheet, row: int, values: Sequence[object], ev_activity: str, ev_tier: str,
-                    border: Border, set_height: bool = True) -> None:
+                    border: Border, set_height: bool = True, soft: Sequence[str] = ()) -> None:
     fill = _fill(CATEGORY_FILLS.get(ev_activity, CATEGORY_FILLS["Other"]))
     for idx, ((header, width, align, wraps), value) in enumerate(zip(COLUMNS, values), start=1):
         cell = ws.cell(row=row, column=idx, value=value if value != "" else None)
@@ -176,8 +205,12 @@ def style_event_row(ws: Worksheet, row: int, values: Sequence[object], ev_activi
         cell.fill = fill
         cell.border = border
         cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wraps)
-        if header in ("Start Date", "End Date", "Added On") and isinstance(value, (date, datetime)):
+        if header in DATE_HEADERS and isinstance(value, (date, datetime)):
             cell.number_format = DATE_FORMAT
+            if header in soft:
+                cell.font = _font(color=SOFT_INK, italic=True)
+        elif header == "End Date" and value == MULTIPLE_DATES:
+            cell.font = _font(color=SOFT_INK, italic=True)
         elif header == "Tier":
             bg, fg = TIER_STYLES.get(ev_tier, TIER_STYLES[TIER_UNKNOWN])
             cell.fill = _fill(bg)
@@ -186,9 +219,6 @@ def style_event_row(ws: Worksheet, row: int, values: Sequence[object], ev_activi
             bg, fg = REGION_STYLES.get(str(value), REGION_STYLES["India"])
             cell.fill = _fill(bg)
             cell.font = _font(size=8, bold=True, color=fg)
-        elif header == "Link" and value:
-            cell.hyperlink = str(value)
-            cell.font = _font(color=LINK_INK, underline="single")
         elif header == "Organizer" and isinstance(value, str) and value.startswith("Source:"):
             cell.font = _font(color="6B6B6B", italic=True)
     if set_height:
@@ -204,8 +234,9 @@ def band_row(ws: Worksheet, row: int, text: str, fill: str, size: float = 11, la
     ws.row_dimensions[row].height = 20
 
 
-def header_row(ws: Worksheet, row: int) -> None:
-    for idx, (header, width, _a, _w) in enumerate(COLUMNS, start=1):
+def header_row(ws: Worksheet, row: int, headers: Sequence[str] = HEADERS) -> None:
+    for idx, header in enumerate(headers, start=1):
+        width = FIELDS[header][0]
         cell = ws.cell(row=row, column=idx, value=header)
         cell.font = _font(size=10, bold=True, color=CREAM)
         cell.fill = _fill(HEADER_FILL)
@@ -222,6 +253,7 @@ class WriteResult:
     saved_to: Path
     new_in_master: int = 0
     warnings: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)       # worth a line in the log, not a warning
 
 
 def _norm_header(value: object) -> str:
@@ -338,9 +370,10 @@ class MasterIndex:
             if not title:
                 continue
             if c_link:
-                link = master.cell(row=r, column=c_link).value
-                if link:
-                    self.links.add(str(link))
+                cell = master.cell(row=r, column=c_link)
+                for link in (cell.value, cell.hyperlink.target if cell.hyperlink else None):
+                    if link:
+                        self.links.add(str(link))
             start = master.cell(row=r, column=c_start).value if c_start else None
             if isinstance(start, datetime):
                 start = start.date()
@@ -368,35 +401,132 @@ class MasterIndex:
         return self.first_added.get(ev.identity())
 
 
-def _ensure_master_columns(master: Worksheet, header_row_no: int, cols: Dict[str, int]) -> Dict[str, int]:
-    """Add the Link / Added On header cells if the Master predates them (no other cell changes)."""
-    last = max(cols.values()) if cols else 0
-    ref = master.cell(row=header_row_no, column=cols.get("eventname", 1))
-    for header in ("Link", "Added On"):
-        key = _norm_header(header)
-        if key in cols:
+def _column_dims(ws: Worksheet) -> Dict[int, object]:
+    """{column number: its ColumnDimension} (one dimension can cover several columns)."""
+    out: Dict[int, object] = {}
+    for key, dim in list(ws.column_dimensions.items()):
+        lo = dim.min or column_index_from_string(key)
+        for col in range(lo, (dim.max or lo) + 1):
+            out[col] = dim
+    return out
+
+
+def _shift_ref(ref: str, idx: int, delta: int) -> Optional[str]:
+    """A range like "A3:M120" after deleting column ``idx`` (delta -1) or inserting one before it (+1)."""
+    min_col, min_row, max_col, max_row = range_boundaries(ref)
+    if delta < 0:
+        if min_col > idx:
+            min_col -= 1
+        if max_col >= idx:
+            max_col -= 1
+        if max_col < min_col:
+            return None
+    else:
+        if min_col >= idx:
+            min_col += 1
+        if max_col >= idx:
+            max_col += 1
+    return f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{max_row}"
+
+
+def _change_column(ws: Worksheet, idx: int, delta: int) -> None:
+    """Delete column ``idx`` (delta -1) or insert an empty one before it (delta +1).
+
+    openpyxl only moves the cells, so merged bands, column widths, hyperlink anchors, the filter range
+    and frozen panes are carried along here."""
+    merges = []
+    for rng in list(ws.merged_cells.ranges):
+        if rng.max_col < idx:
             continue
-        last += 1
-        cell = master.cell(row=header_row_no, column=last, value=header)
-        cell.font = Font(name=ref.font.name or FONT, size=ref.font.sz, bold=True,
-                         color=ref.font.color.rgb if ref.font.color is not None and isinstance(ref.font.color.rgb, str) else CREAM)
-        cell.fill = _fill(ref.fill.fgColor.rgb[-6:]) if ref.fill is not None and ref.fill.fill_type and isinstance(ref.fill.fgColor.rgb, str) else _fill(HEADER_FILL)
-        cell.border = _border()
+        merges.append(rng.bounds)
+        ws.unmerge_cells(rng.coord)
+    dims = _column_dims(ws)
+    if delta < 0:
+        for min_col, min_row, max_col, _max_row in merges:
+            if min_col == idx < max_col:      # a band whose text sits in the column going away
+                src, dst = ws.cell(row=min_row, column=idx), ws.cell(row=min_row, column=idx + 1)
+                dst.value, dst._style = src.value, copy(src._style)
+        ws.delete_cols(idx)
+    else:
+        ws.insert_cols(idx)
+    for key in list(ws.column_dimensions.keys()):
+        del ws.column_dimensions[key]
+    for col, dim in sorted(dims.items()):
+        if delta < 0 and col == idx:
+            continue
+        new_col = col if col < idx else col + delta
+        moved = copy(dim)
+        moved.index = get_column_letter(new_col)
+        moved.min = moved.max = new_col
+        ws.column_dimensions[moved.index] = moved
+    for bounds in merges:
+        ref = _shift_ref("{}{}:{}{}".format(get_column_letter(bounds[0]), bounds[1], get_column_letter(bounds[2]),
+                                           bounds[3]), idx, delta)
+        if ref and range_boundaries(ref)[0:2] != range_boundaries(ref)[2:4]:
+            ws.merge_cells(ref)
+    for cell in list(ws._cells.values()):          # links remember their cell; point them at the new one
+        if getattr(cell, "hyperlink", None) is not None:
+            cell.hyperlink.ref = cell.coordinate
+    if ws.auto_filter.ref:
+        ws.auto_filter.ref = _shift_ref(ws.auto_filter.ref, idx, delta)
+        ws.auto_filter.filterColumn = []
+        ws.auto_filter.sortState = None
+    if ws.freeze_panes:
+        row, col = coordinate_to_tuple(ws.freeze_panes)
+        if idx < col:                                  # the frozen columns themselves changed
+            ws.freeze_panes = f"{get_column_letter(max(1, col + delta))}{row}"
+
+
+def shape_master_columns(master: Worksheet, header_row_no: int) -> Tuple[Dict[str, int], List[str]]:
+    """Bring an older Master to the agreed columns. Returns (columns, what changed).
+
+    * Ticket Platform(s) and Link are removed (StepOne no longer keeps them; the workbook is backed up
+      before every save).
+    * Register By is added just before Start Date, styled like it; Added On is added at the end.
+    Rows are never edited otherwise. On a Master that already has this layout nothing happens."""
+    changes: List[str] = []
+    while True:
+        dropped = [c for c in range(1, master.max_column + 1)
+                   if _norm_header(master.cell(row=header_row_no, column=c).value) in DROPPED_HEADERS]
+        if not dropped:
+            break
+        name = str(master.cell(row=header_row_no, column=dropped[-1]).value).strip()
+        _change_column(master, dropped[-1], -1)
+        changes.append(f"removed the {name} column")
+    header_row_no, cols = find_header(master)
+    if "registerby" not in cols and "startdate" in cols:
+        at = cols["startdate"]
+        _change_column(master, at, +1)
+        for r in range(header_row_no, master.max_row + 1):
+            src = master.cell(row=r, column=at + 1)
+            if src.has_style and not isinstance(master.cell(row=r, column=at), MergedCell):
+                master.cell(row=r, column=at)._style = copy(src._style)
+        head = master.cell(row=header_row_no, column=at, value="Register By")
+        head.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        if get_column_letter(at + 1) in master.column_dimensions:
+            master.column_dimensions[get_column_letter(at)].width = master.column_dimensions[get_column_letter(at + 1)].width
+        changes.append("added Register By beside Start Date")
+        header_row_no, cols = find_header(master)
+    if "addedon" not in cols:
+        last = max(cols.values()) + 1
+        ref = master.cell(row=header_row_no, column=cols.get("eventname", 1))
+        cell = master.cell(row=header_row_no, column=last, value="Added On")
+        cell._style = copy(ref._style)
         cell.alignment = Alignment(horizontal="center")
-        cols[key] = last
-        letter = get_column_letter(last)
-        if letter not in master.column_dimensions:
-            master.column_dimensions[letter].width = {"Link": 38, "Added On": 11}[header]
-    return cols
+        master.column_dimensions[get_column_letter(last)].width = FIELDS["Added On"][0]
+        header_row_no, cols = find_header(master)
+    return cols, changes
 
 
 def append_to_master(wb: Workbook, master: Worksheet, events: Sequence[Event], run_at: datetime,
-                     window: Tuple[date, date]) -> Tuple[int, Dict[str, date]]:
+                     window: Tuple[date, date], changes: Optional[List[str]] = None) -> Tuple[int, Dict[str, date]]:
     """Append events not yet in the Master. Returns (count, {identity: added-on date})."""
     header_row_no, cols = find_header(master)
     if not header_row_no:
         raise ValueError(f"Could not find the header row (with 'Event Name') in sheet '{master.title}'.")
-    cols = _ensure_master_columns(master, header_row_no, cols)
+    cols, changed = shape_master_columns(master, header_row_no)
+    if changes is not None:
+        changes.extend(changed)
     index = MasterIndex(wb, master, header_row_no, cols)
 
     added_on: Dict[str, date] = {}
@@ -415,8 +545,8 @@ def append_to_master(wb: Workbook, master: Worksheet, events: Sequence[Event], r
 
     # Column positions follow the Master's own headers, whatever their order.
     positions: List[Optional[int]] = []
-    aliases = {"citycities": ("citycities", "city"), "ticketplatforms": ("ticketplatforms", "ticketplatform", "platform")}
-    for header in HEADERS:
+    aliases = {"citycities": ("citycities", "city")}
+    for header in MASTER_HEADERS:
         key = _norm_header(header)
         col = next((cols[k] for k in aliases.get(key, (key,)) if k in cols), None)
         positions.append(col)
@@ -450,9 +580,9 @@ def append_to_master(wb: Workbook, master: Worksheet, events: Sequence[Event], r
                      CITY_BAND_FILLS[_city_rank(ev.city) % len(CITY_BAND_FILLS)], size=9, last_col=last_col)
         row += 1
         serial += 1
-        values = event_row(ev, serial, run_at.date())
+        values = event_row(ev, serial, run_at.date(), MASTER_HEADERS)
         fill = _fill(CATEGORY_FILLS.get(ev.activity_type, CATEGORY_FILLS["Other"]))
-        for (header, _w, _align, _wraps), value, col in zip(COLUMNS, values, positions):
+        for header, value, col in zip(MASTER_HEADERS, values, positions):
             if not col:
                 continue
             cell = master.cell(row=row, column=col, value=value if value != "" else None)
@@ -460,23 +590,26 @@ def append_to_master(wb: Workbook, master: Worksheet, events: Sequence[Event], r
             cell.fill = fill
             cell.border = border
             cell.alignment = Alignment(horizontal="center" if header in centred else None)
-            if header in ("Start Date", "End Date", "Added On") and isinstance(value, (date, datetime)):
+            if header in DATE_HEADERS and isinstance(value, (date, datetime)):
                 cell.number_format = DATE_FORMAT
+                if header == "Register By" and ev.register_by_inferred:
+                    cell.font = _font(color=SOFT_INK, italic=True)
+            elif header == "End Date" and value == MULTIPLE_DATES:
+                cell.font = _font(color=SOFT_INK, italic=True)
             elif header == "Tier":
                 bg, fg = TIER_STYLES.get(ev.tier, TIER_STYLES[TIER_UNKNOWN])
                 cell.fill, cell.font = _fill(bg), _font(bold=True, color=fg)
             elif header == "Region":
                 bg, fg = REGION_STYLES["India"]
                 cell.fill, cell.font = _fill(bg), _font(size=8, bold=True, color=fg)
-            elif header == "Link" and value:
-                cell.hyperlink = str(value)
-                cell.font = _font(color=LINK_INK, underline="single")
             elif header == "Organizer" and isinstance(value, str) and value.startswith("Source:"):
                 cell.font = _font(color="6B6B6B", italic=True)
 
     _append_index(wb, new_events, run_at)
     if master.freeze_panes is None:
         master.freeze_panes = f"C{header_row_no + 1}"
+    if not _has_print_layout(master):     # print settings only; no cell changes
+        fit_print_to_width(master, f"1:{header_row_no}")
     return len(new_events), added_on
 
 
@@ -510,7 +643,7 @@ def write_calendar_sheet(ws: Worksheet, title: str, subtitle: str, events: Seque
     sub.font = _font(size=8, color=SUBTITLE_INK)
     sub.fill = _fill(SUBTITLE_FILL)
     sub.alignment = Alignment(horizontal="left", vertical="center", indent=1, wrap_text=True)
-    ws.row_dimensions[2].height = 26
+    ws.row_dimensions[2].height = 26 if len(subtitle) <= 260 else 36
     header_row(ws, 3)
 
     row = 3
@@ -535,7 +668,8 @@ def write_calendar_sheet(ws: Worksheet, title: str, subtitle: str, events: Seque
         row += 1
         serial += 1
         values = event_row(ev, serial, added_on.get(ev.identity()))
-        style_event_row(ws, row, values, ev.activity_type, ev.tier, border)
+        style_event_row(ws, row, values, ev.activity_type, ev.tier, border,
+                        soft=("Register By",) if ev.register_by_inferred else ())
     if not events:
         row += 1
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=N_COLS)
@@ -546,7 +680,14 @@ def write_calendar_sheet(ws: Worksheet, title: str, subtitle: str, events: Seque
 
     ws.freeze_panes = "C4"
     ws.auto_filter.ref = f"A3:{LAST_COL}{max(row, 4)}"
-    ws.print_title_rows = "1:3"
+    fit_print_to_width(ws, "1:3")
+    return row
+
+
+def fit_print_to_width(ws: Worksheet, title_rows: Optional[str] = None) -> None:
+    """Landscape A4, all columns on one page width (PDF export / printing)."""
+    if title_rows:
+        ws.print_title_rows = title_rows
     ws.page_setup.orientation = "landscape"
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.fitToWidth = 1
@@ -554,7 +695,11 @@ def write_calendar_sheet(ws: Worksheet, title: str, subtitle: str, events: Seque
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_margins.left = ws.page_margins.right = 0.3
     ws.page_margins.top = ws.page_margins.bottom = 0.5
-    return row
+
+
+def _has_print_layout(ws: Worksheet) -> bool:
+    props = ws.sheet_properties.pageSetUpPr
+    return bool((props is not None and props.fitToPage) or ws.page_setup.orientation)
 
 
 def _city_rank(city: str) -> int:
@@ -601,14 +746,14 @@ def write_summary(wb: Workbook, ws: Worksheet, rolling_title: str, last_row: int
             c.border = _border()
         ws.row_dimensions[row].height = 28
 
-    def matrix(start: int, labels: Sequence[str], col_letter: str, fills: Optional[Dict[str, str]] = None) -> int:
+    def matrix(start: int, labels: Sequence[str], column: str, fills: Optional[Dict[str, str]] = None) -> int:
         head(start, ["City"] + list(labels) + ["Total"])
         r = start
         for city in cities:
             r += 1
             ws.cell(row=r, column=1, value=city).font = _font(bold=True)
             for j, label in enumerate(labels, start=2):
-                c = ws.cell(row=r, column=j, value=f'=COUNTIFS({rng("G")},$A{r},{rng(col_letter)},{get_column_letter(j)}${start})')
+                c = ws.cell(row=r, column=j, value=f'=COUNTIFS({rng(col_letter("City / Cities"))},$A{r},{rng(column)},{get_column_letter(j)}${start})')
                 c.font, c.alignment = _font(), Alignment(horizontal="center")
                 if fills and label in fills:
                     c.fill = _fill(fills[label])
@@ -641,19 +786,19 @@ def write_summary(wb: Workbook, ws: Worksheet, rolling_title: str, last_row: int
 
     tier_labels = TIERS + [TIER_UNKNOWN]
     ws.cell(row=4, column=1, value="Events by city and tier").font = _font(size=10, bold=True)
-    end = matrix(5, tier_labels, "D", {t: TIER_STYLES[t][0] for t in tier_labels})
+    end = matrix(5, tier_labels, col_letter("Tier"), {t: TIER_STYLES[t][0] for t in tier_labels})
     start = end + 3
     ws.cell(row=start - 1, column=1, value="Events by city and activity type").font = _font(size=10, bold=True)
-    end = matrix(start, ACTIVITY_TYPES, "C", CATEGORY_FILLS)
+    end = matrix(start, ACTIVITY_TYPES, col_letter("Activity Type"), CATEGORY_FILLS)
 
     r = end + 3
-    ws.cell(row=r - 1, column=1, value="Events by ticket platform").font = _font(size=10, bold=True)
+    ws.cell(row=r - 1, column=1, value="Events by platform (at the time of this run)").font = _font(size=10, bold=True)
     head(r, ["Platform", "Events"])
     platforms = Counter(p for ev in events for p in (ev.platforms or [ev.platform]))
-    for name, _n in platforms.most_common():
+    for name, n in platforms.most_common():
         r += 1
         ws.cell(row=r, column=1, value=name).font = _font()
-        c = ws.cell(row=r, column=2, value=f'=COUNTIF({rng("K")},"*{name}*")')
+        c = ws.cell(row=r, column=2, value=n)
         c.font, c.alignment = _font(), Alignment(horizontal="center")
         for j in (1, 2):
             ws.cell(row=r, column=j).border = _border(GRID)
@@ -667,10 +812,10 @@ def write_summary(wb: Workbook, ws: Worksheet, rolling_title: str, last_row: int
         "Activity Type: from each platform's own category, then the event title and description.",
         "Organizer: as published on the event page; when none is published the cell names the source "
         "platform (shown in grey italics, e.g. 'Source: BookMyShow').",
-        "Link: the event's ticket page. Duplicates listed on several platforms are merged into one row; all "
-        "platforms are listed in Ticket Platform(s).",
-        "Master Calander is never edited - new events are only appended below the last row. The Rolling "
-        "Calendar and city tabs are rebuilt on every run.",
+        "Register By: the booking deadline the site publishes; in grey when there is none and the start date "
+        "is shown. End Date: 'Multiple dates' when an event runs on many dates.",
+        "Master Calander: new events are only appended below the last row. The Rolling Calendar and city "
+        "tabs are rebuilt on every run. Duplicates listed on several platforms are merged into one row.",
     ]
     for line in notes:
         r += 1
@@ -681,7 +826,9 @@ def write_summary(wb: Workbook, ws: Worksheet, rolling_title: str, last_row: int
         ws.row_dimensions[r].height = 26
 
 
-RUN_LOG_HEADERS = ["Run At", "Window", "Cities", "Events in Window", "New in Master", "By Source", "Warnings"]
+RUN_LOG_HEADERS = ["Run At", "Window", "Cities", "Events in Window", "New in Master", "By Source", "Warnings",
+                   "Minutes", "Event Pages"]
+RUN_LOG_WIDTHS = [18, 26, 40, 10, 10, 70, 60, 9, 70]
 
 
 def append_run_log(wb: Workbook, report, total_events: int, new_rows: int) -> None:
@@ -690,24 +837,29 @@ def append_run_log(wb: Workbook, report, total_events: int, new_rows: int) -> No
     else:
         ws = wb.create_sheet(RUN_LOG_SHEET)
         ws.sheet_properties.tabColor = "7F8C8D"
-        for i, (h, w) in enumerate(zip(RUN_LOG_HEADERS, [18, 26, 40, 10, 10, 70, 60]), start=1):
-            c = ws.cell(row=1, column=i, value=h)
-            c.font = _font(size=9, bold=True, color=CREAM)
-            c.fill = _fill(HEADER_FILL)
-            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            ws.column_dimensions[get_column_letter(i)].width = w
         ws.freeze_panes = "A2"
+    for i, (h, w) in enumerate(zip(RUN_LOG_HEADERS, RUN_LOG_WIDTHS), start=1):
+        if ws.cell(row=1, column=i).value:
+            continue        # logs from older versions get the newer columns added at the end
+        c = ws.cell(row=1, column=i, value=h)
+        c.font = _font(size=9, bold=True, color=CREAM)
+        c.fill = _fill(HEADER_FILL)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.column_dimensions[get_column_letter(i)].width = w
     by_source = "; ".join(f"{name}: {st.get('kept', 0)} kept / {st.get('discovered', 0)} found"
                           for name, st in report.per_source.items())
+    minutes = (now_ist() - report.started).total_seconds() / 60
     row = [report.started.replace(microsecond=0),
            f"{report.window_start:%d %b %Y} – {report.window_end:%d %b %Y}",
-           ", ".join(report.cities), total_events, new_rows, by_source, " | ".join(report.warnings)[:1000]]
+           ", ".join(report.cities), total_events, new_rows, by_source, " | ".join(report.warnings)[:1000],
+           round(minutes) if 0 <= minutes < 24 * 60 else None,
+           report.detail_line() if hasattr(report, "detail_line") else ""]
     ws.append(row)
     r = ws.max_row
     for i in range(1, len(row) + 1):
         c = ws.cell(row=r, column=i)
         c.font = _font(size=9)
-        c.alignment = Alignment(vertical="top", wrap_text=i in (3, 6, 7))
+        c.alignment = Alignment(vertical="top", wrap_text=i in (3, 6, 7, 9))
         c.border = _border(GRID)
     ws.cell(row=r, column=1).number_format = "d mmm yyyy h:mm AM/PM"
 
@@ -773,14 +925,15 @@ def create_template(path: Path, master_name: str) -> Workbook:
 
 
 def init_master_sheet(master: Worksheet) -> None:
-    master.merge_cells(start_row=1, start_column=1, end_row=1, end_column=N_COLS)
+    n = len(MASTER_HEADERS)
+    master.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n)
     t = master.cell(row=1, column=1, value="MASTER EVENTS CALENDAR · INDIA")
     t.font, t.fill = _font(size=13, bold=True, color=CREAM), _fill(TITLE_FILL)
     t.alignment = Alignment(horizontal="center")
-    master.merge_cells(start_row=2, start_column=1, end_row=2, end_column=N_COLS)
+    master.merge_cells(start_row=2, start_column=1, end_row=2, end_column=n)
     s = master.cell(row=2, column=1, value="Maintained by StepOne · the scraper only appends new events below the last row")
     s.font, s.fill = _font(size=8, color=SUBTITLE_INK), _fill(SUBTITLE_FILL)
-    header_row(master, 3)
+    header_row(master, 3, MASTER_HEADERS)
     master.freeze_panes = "C4"
 
 
@@ -853,8 +1006,12 @@ def write_workbook(settings, events: Sequence[Event], report) -> WriteResult:
         master = wb.create_sheet(settings.master_sheet)
         init_master_sheet(master)
         warnings.append(f"No Master sheet named '{settings.master_sheet}' was found, so one was added.")
-    new_count, added_on = append_to_master(wb, master, events, run_at, window)
+    changes: List[str] = []
+    new_count, added_on = append_to_master(wb, master, events, run_at, window, changes)
     report.new_in_master = new_count
+    notes = []
+    if changes:
+        notes.append(f"Master: {', '.join(changes)} (a copy of the workbook from before is in backups/).")
 
     generated = _generated_sheets(wb)
     made: List[str] = []
@@ -865,7 +1022,9 @@ def write_workbook(settings, events: Sequence[Event], report) -> WriteResult:
     title = f"ROLLING EVENTS CALENDAR · {span} · " + " · ".join(c.upper() for c in report.cities)
     subtitle = (f"Sources: {_source_line(events, report.sources)}  |  {len(events)} events  |  City by city, "
                 f"each in date order  |  Last updated: {run_at:%d %b %Y, %I:%M %p} IST  |  Tier = entry ticket price "
-                f"(see Guide)  |  Use the filter arrows in row 3 to pick a city, tier or category")
+                f"(see Guide)  |  Register By in grey: the site gives no separate deadline, so the start date is "
+                f"shown  |  {MULTIPLE_DATES}: runs on many dates, see the link  |  Use the filter arrows in "
+                f"row 3 to pick a city, tier or category")
     failed = getattr(report, "failed_sources", None) or []
     if failed:
         subtitle = (f"⚠ Not read this run (site unreachable or refused): {', '.join(failed)} - their events are "
@@ -894,6 +1053,8 @@ def write_workbook(settings, events: Sequence[Event], report) -> WriteResult:
     for stale in generated:
         if stale not in made and stale in wb.sheetnames and stale not in (master.title,):
             del wb[stale]
+    if "Guide" in wb.sheetnames and not _has_print_layout(wb["Guide"]):
+        fit_print_to_width(wb["Guide"])
     append_run_log(wb, report, len(events), new_count)
     _remember_generated(wb, made)
     for hidden in (RUN_LOG_SHEET, INDEX_SHEET, META_SHEET):
@@ -907,4 +1068,4 @@ def write_workbook(settings, events: Sequence[Event], report) -> WriteResult:
     saved, warning = save_workbook(wb, path)
     if warning:
         warnings.append(warning)
-    return WriteResult(saved_to=saved, new_in_master=new_count, warnings=warnings)
+    return WriteResult(saved_to=saved, new_in_master=new_count, warnings=warnings, notes=notes)

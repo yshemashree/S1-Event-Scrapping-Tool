@@ -7,7 +7,7 @@ from openpyxl import load_workbook
 from conftest import make_reference_workbook
 from s1scraper.classify import classify_activity, classify_tier
 from s1scraper.config import Settings
-from s1scraper.excel import HEADERS, INDEX_SHEET, META_SHEET, is_locked, write_workbook
+from s1scraper.excel import HEADERS, INDEX_SHEET, MASTER_HEADERS, META_SHEET, is_locked, write_workbook
 from s1scraper.models import Event
 from s1scraper.pipeline import RunReport, build_notes
 
@@ -62,20 +62,72 @@ def snapshot(ws, max_row, max_col):
     return out
 
 
-def test_existing_master_cells_are_never_changed(settings):
+# StepOne's 13 columns -> the agreed 14: Register By goes in before Start Date (E), Ticket Platform(s) (K) goes
+OLD_TO_NEW = {1: 1, 2: 2, 3: 3, 4: 4, 5: 6, 6: 7, 7: 8, 8: 9, 9: 10, 10: 11, 12: 12, 13: 13}
+
+
+def test_existing_master_rows_keep_their_content(settings):
     path = Path(settings.workbook_path)
-    before_wb = load_workbook(path)
-    m0 = before_wb["Master Calander "]
+    m0 = load_workbook(path)["Master Calander "]
     dims = (m0.max_row, m0.max_column)
     before = snapshot(m0, *dims)
     merges = {str(r) for r in m0.merged_cells.ranges}
 
-    write_workbook(settings, EVENTS(), report())
-    write_workbook(settings, EVENTS(), report(started=datetime(2026, 10, 15, 9)))
-
+    res = write_workbook(settings, EVENTS(), report())
+    assert any("removed the Ticket Platform(s) column" in n and "Register By" in n for n in res.notes)
     m1 = load_workbook(path)["Master Calander "]
-    assert snapshot(m1, *dims) == before
-    assert merges <= {str(r) for r in m1.merged_cells.ranges}
+    after = snapshot(m1, dims[0], 14)
+    for (r, c), cell in before.items():
+        if c in OLD_TO_NEW:
+            assert after[(r, OLD_TO_NEW[c])] == cell, (r, c)    # every other cell keeps its value and look
+    assert [m1.cell(row=3, column=c).value for c in range(1, 15)] == MASTER_HEADERS
+    assert merges <= {str(r) for r in m1.merged_cells.ranges}  # title and month bands still span A:M
+    assert not [c.coordinate for row in m1.iter_rows() for c in row if c.hyperlink]
+    assert m1.cell(row=6, column=5).fill.fgColor.rgb == m1.cell(row=6, column=6).fill.fgColor.rgb   # row look
+
+    snap = snapshot(m1, m1.max_row, 14)
+    res = write_workbook(settings, EVENTS(), report(started=datetime(2026, 10, 15, 9)))
+    assert not res.notes                                       # nothing left to change: append-only from here
+    assert snapshot(load_workbook(path)["Master Calander "], m1.max_row, 14) == snap
+
+
+def test_master_from_an_older_scraper_version_is_tidied(settings):
+    """A Master that already got the old Link / Added On columns (and links in Ticket Platform(s))."""
+    path = Path(settings.workbook_path)
+    wb = load_workbook(path)
+    m = wb["Master Calander "]
+    m["N3"], m["O3"] = "Link", "Added On"
+    m["B12"], m["E12"], m["K12"] = "Old Scraper Row", datetime(2026, 10, 12), "BookMyShow"
+    m["N12"].hyperlink = "https://in.bookmyshow.com/events/old-scraper-row/ET00999999"
+    m["K12"].hyperlink = "https://in.bookmyshow.com/events/old-scraper-row/ET00999999"
+    m["O12"] = datetime(2026, 10, 1)
+    m["A11"] = "▌ SCRAPER UPDATE · 01 OCT 2026 · 1 NEW EVENT"
+    m.merge_cells("A11:O11")
+    m.column_dimensions["N"].width, m.column_dimensions["O"].width = 38, 11
+    m.freeze_panes = "C4"
+    wb.save(path)
+
+    write_workbook(settings, EVENTS(), report())
+    m = load_workbook(path)["Master Calander "]
+    assert [m.cell(row=3, column=c).value for c in range(1, 15)] == MASTER_HEADERS
+    assert m.cell(row=3, column=15).value is None
+    assert "A11:N11" in {str(r) for r in m.merged_cells.ranges}          # the old band spans the new width
+    assert m["B12"].value == "Old Scraper Row" and m["F12"].value == datetime(2026, 10, 12)
+    assert m["N12"].value == datetime(2026, 10, 1)                       # Added On kept, one column left
+    assert m.column_dimensions["N"].width == 11 and m.freeze_panes == "C4"
+    assert not [c.coordinate for row in m.iter_rows() for c in row if c.hyperlink]
+
+
+def test_client_sheet_has_no_prices_platforms_or_links(settings):
+    write_workbook(settings, EVENTS(), report())
+    ws = load_workbook(settings.workbook_path)["Rolling Calendar"]
+    header = [ws.cell(row=3, column=c).value for c in range(1, ws.max_column + 1)]
+    assert header == HEADERS and len(HEADERS) == 13
+    assert not {"Price Range", "Ticket Platform(s)", "Link"} & set(header)
+    assert header[4:6] == ["Register By", "Start Date"]
+    assert not [c.coordinate for row in ws.iter_rows() for c in row if c.hyperlink]
+    texts = [str(c.value) for row in ws.iter_rows(min_row=4) for c in row if c.value]
+    assert not any("bookmyshow.com" in t or "₹" in t for t in texts)
 
 
 def test_new_events_are_appended_once(settings):
@@ -86,18 +138,23 @@ def test_new_events_are_appended_once(settings):
     assert r2.new_in_master == 0
 
     m = load_workbook(path)["Master Calander "]
-    assert m.cell(row=3, column=14).value == "Link" and m.cell(row=3, column=15).value == "Added On"
+    assert [m.cell(row=3, column=c).value for c in range(1, 15)] == MASTER_HEADERS
     assert m.cell(row=10, column=1).value.startswith("▌ SCRAPER UPDATE · 08 OCT 2026 · 3 NEW EVENTS")
-    rows = [[m.cell(row=r, column=c).value for c in range(1, 16)] for r in range(11, 14)]
+    assert "A10:N10" in {str(r) for r in m.merged_cells.ranges}
+    bands = [m.cell(row=r, column=1).value for r in (11, 13, 15)]
+    assert bands == ["MUMBAI · 1 EVENT", "PUNE · 1 EVENT", "DELHI NCR · 1 EVENT"]   # city by city
+    rows = [[m.cell(row=r, column=c).value for c in range(1, 15)] for r in (12, 14, 16)]
     assert [r[0] for r in rows] == [4, 5, 6]                     # S.No. continues after the hand-typed 3
-    assert [r[1] for r in rows] == ["Pune Jazz Night", "Prateek Kuhad Live", "Delhi Wine Soirée"]   # by date
-    assert rows[0][4] == datetime(2026, 10, 11) and m.cell(row=11, column=5).number_format == "d mmm yyyy"
-    assert rows[0][7] == "High Spirits Cafe, Koregaon Park"
-    assert rows[0][8] == "Source: BookMyShow"                    # organiser fallback names the source
-    assert rows[1][9] == "₹1,499 – ₹6,999" and rows[1][3] == "Premium"
-    assert m.cell(row=12, column=14).hyperlink.target == rows[1][13] and rows[1][13].startswith("https://")
-    assert rows[0][14] == datetime(2026, 10, 8)
-    assert m.max_row == 13
+    assert [r[1] for r in rows] == ["Prateek Kuhad Live", "Pune Jazz Night", "Delhi Wine Soirée"]
+    pune = rows[1]
+    assert pune[4] == pune[5] == datetime(2026, 10, 11)          # no deadline published: Register By = start
+    assert m.cell(row=14, column=6).number_format == "d mmm yyyy"
+    assert pune[8] == "High Spirits Cafe, Koregaon Park"
+    assert pune[9] == "Source: BookMyShow"                       # organiser fallback names the source
+    assert rows[0][10] == "₹1,499 – ₹6,999" and rows[0][3] == "Premium"   # the price stays: it sets the tier
+    assert pune[13] == datetime(2026, 10, 8)
+    assert not [c.coordinate for row in m.iter_rows() for c in row if c.hyperlink]
+    assert m.max_row == 16
 
 
 def test_rows_deleted_by_hand_are_not_added_again(settings):
@@ -115,35 +172,58 @@ def test_rolling_sheet_is_rebuilt_each_run(settings):
     write_workbook(settings, EVENTS()[1:2], report(started=datetime(2026, 10, 15)))   # only one event now
     wb = load_workbook(path)
     ws = wb["Rolling Calendar"]
-    assert [ws.cell(row=3, column=c).value for c in range(1, 16)] == HEADERS
+    assert [ws.cell(row=3, column=c).value for c in range(1, len(HEADERS) + 1)] == HEADERS
     titles = [ws.cell(row=r, column=2).value for r in range(4, ws.max_row + 1) if ws.cell(row=r, column=2).value]
     assert titles == ["Prateek Kuhad Live"]
-    assert ws.freeze_panes == "C4" and ws.auto_filter.ref.startswith("A3:O")
-    assert ws["A4"].value == "▌ OCTOBER 2026"
+    assert ws.freeze_panes == "C4" and ws.auto_filter.ref.startswith("A3:M")
+    assert ws["A4"].value == "▌ MUMBAI · 1 EVENT"
     assert wb.active.title == "Rolling Calendar"
+
+
+def test_rolling_sheet_goes_city_by_city_in_date_order(settings):
+    events = EVENTS() + [mk("Mumbai Early Show", "Mumbai", datetime(2026, 10, 9, 18), code="ET00410099")]
+    write_workbook(settings, events, report())
+    ws = load_workbook(settings.workbook_path)["Rolling Calendar"]
+    lines = [(ws.cell(row=r, column=1).value, ws.cell(row=r, column=2).value) for r in range(4, ws.max_row + 1)]
+    assert lines == [
+        ("▌ MUMBAI · 3 EVENTS", None), (1, "Mumbai Early Show"), (2, "Aakash Gupta Live"), (3, "Prateek Kuhad Live"),
+        ("▌ PUNE · 1 EVENT", None), (4, "Pune Jazz Night"),
+        ("▌ DELHI NCR · 1 EVENT", None), (5, "Delhi Wine Soirée"),
+    ]
+
+
+def test_default_workbook_is_just_master_and_rolling(settings):
+    write_workbook(settings, EVENTS(), report())
+    write_workbook(settings, EVENTS(), report(started=datetime(2026, 10, 15)))
+    wb = load_workbook(settings.workbook_path)
+    visible = [ws.title for ws in wb.worksheets if ws.sheet_state == "visible"]
+    assert visible == ["Guide", "Master Calander ", "Rolling Calendar"]
+    assert wb["Run Log"].sheet_state == "hidden" and wb["Run Log"].max_row == 3
 
 
 def test_city_tabs_summary_and_run_log(settings):
     path = Path(settings.workbook_path)
+    settings.city_tabs = settings.summary_tab = True
     write_workbook(settings, EVENTS(), report())
     write_workbook(settings, EVENTS(), report(started=datetime(2026, 10, 15)))
     wb = load_workbook(path)
     names = wb.sheetnames
     assert names[:4] == ["Guide", "Master Calander ", "Rolling Calendar", "Summary"]
-    assert names[4:11] == CITIES and names[11] == "Run Log"
+    assert names[4:11] == CITIES and names[11] == "Run Log" and wb["Run Log"].sheet_state == "hidden"
     assert wb[INDEX_SHEET].sheet_state == "hidden" and wb[META_SHEET].sheet_state == "hidden"
     mumbai = [wb["Mumbai"].cell(row=r, column=2).value for r in range(4, wb["Mumbai"].max_row + 1)]
     assert [t for t in mumbai if t] == ["Aakash Gupta Live", "Prateek Kuhad Live"]
     assert "No events found in Kolkata" in wb["Kolkata"]["A4"].value
     summary = wb["Summary"]
     formulas = [c.value for row in summary.iter_rows() for c in row if isinstance(c.value, str) and c.value.startswith("=")]
-    assert any("COUNTIFS('Rolling Calendar'!$G$4:$G$" in f for f in formulas)
+    assert any("COUNTIFS('Rolling Calendar'!$H$4:$H$" in f for f in formulas)    # City / Cities column
     log = wb["Run Log"]
     assert log.max_row == 3 and log.cell(row=3, column=4).value == 4
 
 
 def test_sheet_names_the_user_owns_are_never_replaced(settings):
     path = Path(settings.workbook_path)
+    settings.city_tabs = True
     wb = load_workbook(path)
     wb.create_sheet("Mumbai")["A1"] = "StepOne's own notes"
     wb.save(path)
@@ -155,11 +235,12 @@ def test_sheet_names_the_user_owns_are_never_replaced(settings):
 
 
 def test_turning_off_city_tabs_removes_only_generated_tabs(settings):
+    settings.city_tabs = settings.summary_tab = True
     write_workbook(settings, EVENTS(), report())
-    settings.per_city_tabs = False
+    settings.city_tabs = settings.summary_tab = False
     write_workbook(settings, EVENTS(), report(started=datetime(2026, 10, 15)))
     wb = load_workbook(settings.workbook_path)
-    assert not set(CITIES) & set(wb.sheetnames)
+    assert not set(CITIES) & set(wb.sheetnames) and "Summary" not in wb.sheetnames
     assert "Master Calander " in wb.sheetnames and "Guide" in wb.sheetnames
 
 
@@ -169,7 +250,9 @@ def test_new_workbook_is_created_when_missing(tmp_path):
     assert res.new_in_master == 4 and any("Created a new workbook" in w for w in res.warnings)
     wb = load_workbook(res.saved_to)
     assert wb.sheetnames[:3] == ["Guide", "Master Calander ", "Rolling Calendar"]
-    assert wb["Master Calander "].cell(row=3, column=2).value == "Event Name"
+    master = wb["Master Calander "]
+    assert [master.cell(row=3, column=c).value for c in range(1, 16)] == MASTER_HEADERS + [None]
+    assert not res.notes                                          # a new Master already has the agreed columns
 
 
 def test_locked_workbook_is_saved_next_to_it(settings):

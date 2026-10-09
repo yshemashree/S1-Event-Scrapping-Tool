@@ -4,8 +4,9 @@ Listing grids on BookMyShow/District load more events as you scroll. When a
 plain download does not show them, the page is opened in the Edge or Chrome
 already installed on the computer (or Playwright's bundled Chromium), scrolled
 like a person would, and the JSON the page loads is captured for the
-extractor. It runs on one dedicated thread and waits for the same per-site
-gap as every other request, so it never adds load on a site.
+extractor. A couple of browser windows work side by side (each on its own
+thread, for different sites), and every page waits for the same per-site gap
+as every other request, so it never adds load on a site.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from .fetcher import Cancelled, Fetcher, looks_blocked
+from .fetcher import Cancelled, Fetcher, browser_key, looks_blocked
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,9 @@ class BrowserSettings:
     executable_path: str = ""   # explicit browser binary, overrides channel
     max_scrolls: int = 25
     page_timeout: float = 45.0
+    workers: int = 2            # pages rendered at the same time (different sites)
+    settle_listing_ms: int = 5000
+    settle_detail_ms: int = 3000
 
 
 @dataclass
@@ -73,9 +77,10 @@ class BrowserService:
         self.fetcher = fetcher
         self.settings = settings
         self._queue: "queue.Queue[Optional[tuple]]" = queue.Queue()
-        self._thread: Optional[threading.Thread] = None
+        self._threads: List[threading.Thread] = []
         self._ready = threading.Event()
         self._start_error: Optional[str] = None
+        self._errors: List[str] = []
         self._lock = threading.Lock()
         self.description = ""
 
@@ -84,9 +89,11 @@ class BrowserService:
         if self.settings.mode == "off":
             return False
         with self._lock:
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._run, name="browser", daemon=True)
-                self._thread.start()
+            if not self._threads:
+                for i in range(max(1, self.settings.workers)):
+                    t = threading.Thread(target=self._run, name=f"browser-{i + 1}", daemon=True)
+                    self._threads.append(t)
+                    t.start()
         while not self._ready.wait(0.25):
             self.fetcher.check_stop()
         return self._start_error is None
@@ -97,10 +104,19 @@ class BrowserService:
 
     def close(self) -> None:
         with self._lock:
-            thread = self._thread
-        if thread is not None and thread.is_alive():
+            threads = list(self._threads)
+        for _ in threads:
             self._queue.put(None)
-            thread.join(timeout=20)
+        for thread in threads:
+            if thread.is_alive():
+                thread.join(timeout=20)
+
+    def _failed(self, error: str) -> None:
+        with self._lock:
+            self._errors.append(error)
+            if len(self._errors) >= len(self._threads):      # no window could start at all
+                self._start_error = self._errors[0]
+                self._ready.set()
 
     def _launch(self, pw):
         kwargs = {"headless": self.settings.headless}
@@ -133,8 +149,7 @@ class BrowserService:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            self._start_error = "Playwright is not installed (pip install playwright)"
-            self._ready.set()
+            self._failed("Playwright is not installed (pip install playwright)")
             return
         pw = browser = context = None
         try:
@@ -147,9 +162,8 @@ class BrowserService:
                           if route.request.resource_type in ("image", "media", "font") else route.continue_())
             log.info("Browser ready: %s", self.description)
         except Exception as exc:  # noqa: BLE001
-            self._start_error = str(exc)
             log.warning("Browser unavailable: %s", exc)
-            self._ready.set()
+            self._failed(str(exc))
             for closer in (browser, pw):
                 try:
                     if closer is not None:
@@ -180,15 +194,18 @@ class BrowserService:
                     pass
 
     # --------------------------------------------------------------- render
-    def render(self, url: str, scroll: bool = True, capture_json: bool = True) -> RenderResult:
+    def render(self, url: str, scroll: bool = True, capture_json: bool = True,
+               max_scrolls: Optional[int] = None) -> RenderResult:
         if not self.available():
             return RenderResult(url=url, error=self._start_error or "browser disabled")
         host = urlsplit(url).netloc.lower()
-        if self.fetcher.is_disabled(host):
-            return RenderResult(url=url, blocked=True, error=self.fetcher.is_disabled(host))
+        reason = self.fetcher.is_disabled(host) or self.fetcher.is_disabled(browser_key(host))
+        if reason:
+            return RenderResult(url=url, blocked=True, error=reason)
         real_url = self.fetcher.rewrite(url) if self.fetcher.rewrite else url
         fut: Future = Future()
-        self._queue.put((fut, real_url, {"scroll": scroll, "capture_json": capture_json, "host": host}))
+        self._queue.put((fut, real_url, {"scroll": scroll, "capture_json": capture_json, "host": host,
+                                         "max_scrolls": max_scrolls}))
         while True:
             try:
                 res = fut.result(timeout=0.5)
@@ -203,12 +220,13 @@ class BrowserService:
         res.links = [(un(h), t) for h, t in res.links]
         res.json_payloads = [(un(u), d) for u, d in res.json_payloads]
         if res.blocked:
-            self.fetcher.note_block(host, " (in the browser)")
+            self.fetcher.note_block(browser_key(host), " (in the browser)")
         elif res.ok:
-            self.fetcher.note_success(host)
+            self.fetcher.note_success(browser_key(host))
         return res
 
-    def _render(self, context, url: str, scroll: bool, capture_json: bool, host: str) -> RenderResult:
+    def _render(self, context, url: str, scroll: bool, capture_json: bool, host: str,
+                max_scrolls: Optional[int] = None) -> RenderResult:
         responses: list = []
         timeout_ms = int(self.settings.page_timeout * 1000)
         with self.fetcher.slot(host):
@@ -218,9 +236,9 @@ class BrowserService:
             try:
                 resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 status = resp.status if resp else 0
-                self._settle(page, 8000)
+                self._settle(page, self.settings.settle_listing_ms if scroll else self.settings.settle_detail_ms)
                 if scroll:
-                    self._scroll(page)
+                    self._scroll(page, max_scrolls)
                 html = page.content()
                 links = page.eval_on_selector_all(
                     "a[href]", "els => els.map(e => [e.href, (e.innerText || '').slice(0, 400)])")
@@ -247,9 +265,10 @@ class BrowserService:
         except Exception:  # noqa: BLE001 - long-polling pages never go idle
             pass
 
-    def _scroll(self, page) -> None:
+    def _scroll(self, page, max_scrolls: Optional[int] = None) -> None:
+        limit = self.settings.max_scrolls if max_scrolls is None else min(max_scrolls, self.settings.max_scrolls)
         still = 0
-        for _ in range(max(1, self.settings.max_scrolls)):
+        for _ in range(max(1, limit)):
             self.fetcher.check_stop()
             before = page.evaluate("[document.querySelectorAll('a[href]').length, document.body ? document.body.scrollHeight : 0]")
             page.mouse.wheel(0, random.randint(1800, 2600))

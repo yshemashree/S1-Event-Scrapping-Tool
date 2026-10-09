@@ -3,7 +3,7 @@ from datetime import date, datetime
 import pytest
 
 from s1scraper.normalize import (
-    canonical_url, clean_title, first_sentences, format_inr, format_price_range, iso_duration_to_text,
+    canonical_url, clean_title, first_sentences, format_inr, format_price_range, iso_duration_to_text, one_line,
     parse_date_range, parse_datetime, parse_price_text, parse_price_values, title_tokens, titles_match,
 )
 
@@ -134,3 +134,47 @@ def test_first_sentences_and_duration():
     assert iso_duration_to_text("PT1H30M") == "1 hr 30 mins"
     assert iso_duration_to_text("PT2H") == "2 hrs"
     assert iso_duration_to_text("2 hours") == "2 hours"
+
+
+def test_one_line_notes():
+    assert one_line("About the event: A Hindi play on family ties. Runs 2 hours. Book now!") == "A Hindi play on family ties."
+    assert one_line("Live on stage! Prateek Kuhad plays his new album in full.") == (
+        "Live on stage! Prateek Kuhad plays his new album in full.")
+    long = one_line("word " * 60)
+    assert len(long) <= 140 and long.endswith("…") and "\n" not in one_line("Line one\nline two.")
+
+
+def test_one_line_skips_listing_site_filler():
+    assert one_line("Join Aabo-Hawaa in Mumbai at NCPA on October 7, 2026.") == ""
+    assert one_line("Looking for things to do in Mumbai? Attend Duos at KCC on October 7, 2026.") == ""
+    assert one_line("Book online tickets for Tote Bag Painting in Mumbai on BookMyShow which is a workshops event") == ""
+    assert one_line("The Royal Opera House Mumbai is hosting this Candlelight: Queen vs. ABBA in Mumbai! "
+                    "Get your concert tickets today!") == ""
+    assert one_line("Step into Yayoi Kusama's Infinity Mirror Room. Book online tickets for it on BookMyShow") == (
+        "Step into Yayoi Kusama's Infinity Mirror Room.")
+
+
+def test_webview_flag_is_dropped_from_links():
+    assert canonical_url("https://in.bookmyshow.com/events/pottery/ET00395324?webview=true") == (
+        "https://in.bookmyshow.com/events/pottery/ET00395324")
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("11 Oct 2026 7:30 pm +2400", datetime(2026, 10, 11, 19, 30)),      # crashed a 7-city run
+    ("11 Oct 2026 +530", datetime(2026, 10, 11)),
+    ("11 Oct, 2026 | 7:00 PM | Call +91 98200 12345", datetime(2026, 10, 11, 19, 0)),
+])
+def test_numbers_after_a_date_are_not_time_zones(text, expected):
+    dt, _ = parse_datetime(text, date(2026, 10, 8))
+    assert dt == expected and dt.tzinfo is None
+    sorted([dt, datetime(2026, 10, 9)])                                 # comparable with plain dates
+
+
+def test_text_is_safe_for_excel_and_plain():
+    from s1scraper.normalize import clean_text, plain_text
+
+    assert clean_text("Saturd\ud835 night \x07") == "Saturd night"          # half an emoji broke a workbook
+    assert one_line("𝗪𝗲𝗹𝗰𝗼𝗺𝗲 𝘁𝗼 **Chennai** 𝗔𝗜 𝗕𝘂𝗶𝗹𝗱𝗲𝗿𝘀! 💡 More text") == "Welcome to Chennai AI Builders!"
+    assert one_line("<p>The beauty of rain in raga Malhar.</p>") == "The beauty of rain in raga Malhar."
+    assert plain_text("🎙️ Build Voice Agents \\| No Code") == "Build Voice Agents | No Code"
+    assert one_line("मुंबई में भव्य गरबा उत्सव। सभी का स्वागत है।").startswith("मुंबई में भव्य गरबा")

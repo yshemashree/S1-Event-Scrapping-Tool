@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date
@@ -13,8 +14,8 @@ from ..browser import BrowserService
 from ..cities import CITIES, City, detect_city
 from ..extract import (
     EventWalker, embedded_json, event_from_jsonld, jsonld_events, labeled_facts, listing_cards,
-    locality_of_jsonld, meta_tags, microdata_events, page_price, pipe_facts, soup_of, text_lines,
-    is_platform_name,
+    locality_of_jsonld, meta_tags, microdata_events, page_price, pipe_facts, register_by_from_text, soup_of,
+    text_lines, is_platform_name,
 )
 from ..fetcher import Fetcher
 from ..models import Event
@@ -56,6 +57,7 @@ class SourceStats:
     details_fetched: int = 0
     details_failed: int = 0
     kept: int = 0
+    listing_cut: int = 0          # cities whose further listing pages were skipped for the time limit
     errors: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
@@ -76,6 +78,11 @@ class RunContext:
     use_browser: bool = True
     max_details: int = 1500
     debug_dir: Any = None     # pathlib.Path: save raw pages for diagnostics when set
+    listing_scale: int = 1    # longer windows read more listing pages (1 month = 1, 6 months = 3)
+    listing_deadline: Optional[float] = None   # time.monotonic(): after this only first pages are read
+
+    def listing_time_up(self) -> bool:
+        return self.listing_deadline is not None and time.monotonic() > self.listing_deadline
 
 
 @dataclass
@@ -112,11 +119,19 @@ class Source:
     slug_url_template = ""                     # e.g. "https://site/events/{slug}" for JSON that has only slugs
     fixed_city = ""                            # venue sites: every event is in this city
     national = False                           # one listing for all cities; city from the venue
-    max_listing_pages = 12                     # per city
+    url_city_pattern = ""                      # regex, group 1 = city slug in an event URL
+    max_listing_pages = 12                     # per city, for a window of about a month
+    stop_after_empty_pages = 3                 # stop paging once this many pages in a row add nothing new
+    isolate_city_cookies = False               # forget cookies before each city (site remembers the last city)
     listing_browser = "auto"                   # auto / always / never
+    listing_scrolls: Optional[int] = None      # cap on scrolls per listing page in the browser (None = default)
+    browser_for_seeds = False                  # the city's main lists only fill in fully in a browser
     detail_browser = "auto"
     min_listing_events = 6                     # fewer than this from plain HTML -> try the browser
     fetch_details = True
+    max_browser_details = 60                   # event pages opened in the browser per run (it is slow)
+    min_gap: Optional[Tuple[float, float]] = None   # wider per-request gap for this site (seconds)
+    organizer_published = True                 # False: the site never names organisers (no point waiting for one)
     discover_unknown_links = False             # venue sites: guess event pages from link text/paths
 
     def __init__(self) -> None:
@@ -126,9 +141,11 @@ class Source:
         self._id_rx = re.compile(self.id_pattern, re.I) if self.id_pattern else None
         self._json_id_rx = re.compile(self.json_id_pattern) if self.json_id_pattern else None
         self._working_slug: Dict[Tuple[str, str], str] = {}
+        self._slug_choice: Dict[str, int] = {}     # city -> which spelling worked (tried first on its other lists)
         # Set once plain downloads are refused but the browser gets through,
         # so later pages go straight to the browser instead of failing first.
         self._browser_first = False
+        self._browser_details = 0
         self.include_activities = False
 
     # --------------------------------------------------------------- URLs
@@ -203,8 +220,15 @@ class Source:
         queue: deque = deque()
         seen: set = set()
         label = city.name if city else "all cities"
+        if self.isolate_city_cookies:
+            for template in self.listing_templates:
+                ctx.fetcher.reset_cookies(host_of(template))
 
+        loaded_before = self.stats.listing_pages
         for group in self.seeds_for(city):
+            choice = self._slug_choice.get(city.key) if city else None
+            if choice is not None and 0 < choice < len(group):
+                group = [group[choice]] + group[:choice] + group[choice + 1:]
             page, events = self._first_working(ctx, group, city)
             if page is None:
                 continue
@@ -212,15 +236,23 @@ class Source:
             self._collect(found, events)
             self._queue_follow(page, follow_rx, queue, seen)
 
-        pages = len(seen)
-        while queue and pages < self.max_listing_pages:
+        budget = self.max_listing_pages * max(1, ctx.listing_scale)
+        empty_in_a_row = 0
+        while queue and self.stats.listing_pages - loaded_before < budget:
             ctx.fetcher.check_stop()
+            if ctx.listing_time_up():
+                self.stats.listing_cut += 1
+                break
             url = queue.popleft()
             page = self.load_listing(ctx, url)
-            pages += 1
             if page.html:
+                before = len(found)
                 self._collect(found, self.extract_listing(ctx, page, city))
                 self._queue_follow(page, follow_rx, queue, seen)
+                empty_in_a_row = 0 if len(found) > before else empty_in_a_row + 1
+                if empty_in_a_row >= self.stop_after_empty_pages:
+                    break
+        pages = self.stats.listing_pages - loaded_before
 
         events = list(found.values())
         for ev in events:
@@ -235,12 +267,16 @@ class Source:
             alternatives = [self._working_slug[key]]
         best = None
         for url in alternatives:
-            page = self.load_listing(ctx, url)
+            page = self.load_listing(ctx, url, seed=True)
             if not page.html or page.status == 404:
                 continue
             events = self.extract_listing(ctx, page, city)
             if events:
                 self._working_slug[key] = url
+                if city is not None:
+                    spellings = [s for s in self.slugs_for(city) if s in url]
+                    if spellings:
+                        self._slug_choice[city.key] = list(self.slugs_for(city)).index(max(spellings, key=len))
                 return page, events
             best = best or (page, events)
         return best if best else (None, [])
@@ -280,9 +316,9 @@ class Source:
             ev.city = city.name
 
     # ------------------------------------------------------------ listing
-    def load_listing(self, ctx: RunContext, url: str) -> PageData:
+    def load_listing(self, ctx: RunContext, url: str, seed: bool = False) -> PageData:
         if self._browser_first and ctx.use_browser and ctx.browser.available():
-            r = ctx.browser.render(url, scroll=True)
+            r = ctx.browser.render(url, scroll=True, max_scrolls=self._scrolls(ctx))
             if r.ok:
                 self.stats.listing_pages += 1
                 self.stats.listing_pages_via_browser += 1
@@ -304,9 +340,10 @@ class Source:
             n_events = 0
         self._save_debug(ctx, "listing", url, page.html)
         want_browser = ctx.use_browser and self.listing_browser != "never" and res.status != 404 and (
-            self.listing_browser == "always" or n_events < self.min_listing_events)
+            self.listing_browser == "always" or n_events < self.min_listing_events
+            or (seed and self.browser_for_seeds))
         if want_browser and not ctx.fetcher.is_disabled(host_of(url)) and ctx.browser.available():
-            r = ctx.browser.render(url, scroll=True)
+            r = ctx.browser.render(url, scroll=True, max_scrolls=self._scrolls(ctx))
             if r.ok:
                 self.stats.listing_pages_via_browser += 1
                 if res.blocked:
@@ -319,7 +356,12 @@ class Source:
                 self._save_debug(ctx, "listing-browser", url, r.html)
             elif r.error and r.error != "cancelled":
                 self.stats.error(f"browser {url}: {r.error}")
+        log.info("%s listing %s: HTTP %s, %d event links in the plain page, %s", self.name, url, page.status,
+                 n_events, "filled in by the browser" if page.via_browser else "plain download")
         return page
+
+    def _scrolls(self, ctx: RunContext) -> Optional[int]:
+        return self.listing_scrolls * max(1, ctx.listing_scale) if self.listing_scrolls else None
 
     def extract_listing(self, ctx: RunContext, page: PageData, city: Optional[City]) -> List[Event]:
         soup = soup_of(page.html)
@@ -387,32 +429,65 @@ class Source:
         return list(out.values())
 
     # ------------------------------------------------------------- detail
+    def needs_detail(self, ev: Event) -> bool:
+        """False when the listing already gave everything the sheet shows (saves a request)."""
+        if not self.fetch_details or not ev.url:
+            return False
+        complete = (ev.start is not None and ev.has_time and bool(ev.venue)
+                    and (ev.price_min is not None or ev.is_free)
+                    and len(ev.description or "") >= 40
+                    and (bool(ev.organizer) or not self.organizer_published))
+        return not complete
+
+    def alternate_urls(self, url: str) -> List[str]:
+        """Other addresses the same event may live at, tried when its page is missing (override)."""
+        return []
+
+    def _browser_allowed(self, ctx: RunContext) -> bool:
+        return (ctx.use_browser and self.detail_browser != "never"
+                and self._browser_details < self.max_browser_details and ctx.browser.available())
+
+    def _good(self, detail: Optional[Event]) -> bool:
+        return detail is not None and bool(detail.start) and bool(detail.title)
+
     def enrich(self, ctx: RunContext, ev: Event) -> bool:
         """Fetch the event page and merge what it says into ``ev``. True when data was found."""
         if not ev.url:
             return False
-        if self._browser_first and ctx.use_browser and ctx.browser.available():
+        if self._browser_first and self._browser_allowed(ctx):
+            self._browser_details += 1
             r = ctx.browser.render(ev.url, scroll=False)
             if r.ok:
                 self._save_debug(ctx, "detail-browser", ev.url, r.html)
                 detail = self.parse_detail(ctx, r.html, ev, r.final_url or ev.url, r.json_payloads)
                 if detail is not None:
-                    ev.absorb(detail, prefer_other=True)
-                    ev.detail_fetched = True
-                    self.stats.details_fetched += 1
+                    self._accept(ev, detail, r.final_url, verified=self._good(detail))
                     return True
         res = ctx.fetcher.get(ev.url, kind="detail")
         detail = None
         if res.ok and res.text:
             self._save_debug(ctx, "detail", ev.url, res.text)
             detail = self.parse_detail(ctx, res.text, ev, res.final_url or ev.url)
-        good = detail is not None and bool(detail.start) and bool(detail.title)
-        if (not good and ctx.use_browser and self.detail_browser != "never" and res.status not in (404, 410)
-                and not ctx.fetcher.is_disabled(host_of(ev.url)) and ctx.browser.available()):
+        final_url = res.final_url
+        if not self._good(detail) and not res.blocked:
+            # a guessed address (wrong section, renamed event): try the other places it can live
+            for alt in self.alternate_urls(ev.url):
+                r2 = ctx.fetcher.get(alt, kind="detail")
+                if r2.ok and r2.text:
+                    d2 = self.parse_detail(ctx, r2.text, ev, r2.final_url or alt)
+                    if self._good(d2):
+                        detail, final_url = d2, r2.final_url or alt
+                        ev.url = canonical_url(alt)
+                        ev.links[ev.platform] = ev.url
+                        break
+        if (not self._good(detail) and res.status not in (404, 410)
+                and not ctx.fetcher.is_disabled(host_of(ev.url)) and self._browser_allowed(ctx)):
+            self._browser_details += 1
             r = ctx.browser.render(ev.url, scroll=False)
             if r.ok:
                 self._save_debug(ctx, "detail-browser", ev.url, r.html)
                 detail = self.parse_detail(ctx, r.html, ev, r.final_url or ev.url, r.json_payloads)
+                final_url = r.final_url or final_url
                 if res.blocked and detail is not None:
                     self._browser_first = True
             elif r.error and r.error != "cancelled":
@@ -422,10 +497,23 @@ class Source:
             if res.error:
                 self.stats.error(f"{ev.url}: {res.error}")
             return False
+        self._accept(ev, detail, final_url, verified=self._good(detail))
+        return True
+
+    def _accept(self, ev: Event, detail: Event, final_url: str, verified: bool) -> None:
         ev.absorb(detail, prefer_other=True)
         ev.detail_fetched = True
         self.stats.details_fetched += 1
-        return True
+        # keep the address the site itself settled on (after redirects / its canonical link)
+        for cand in (detail.url, final_url):
+            url = canonical_url(cand or "")
+            if url and url != ev.url and self.is_event_url(url) and (self.event_id(url) or "") == (
+                    self.event_id(ev.url) or ""):
+                ev.url = url
+                ev.links[ev.platform or self.platform] = url
+                break
+        if verified:
+            ev.link_verified = True
 
     def _matches(self, cand: Event, ev: Event, page_url: str) -> bool:
         if cand.url and (cand.url == ev.url or cand.url == canonical_url(page_url)):
@@ -478,6 +566,12 @@ class Source:
                     detail.absorb(cand)
 
         meta = meta_tags(soup)
+        # the page's own address for itself (canonical link / og:url / its JSON-LD), when it is an event page
+        for own in [c.url for c, _ in matching[:1]] + [meta.get("canonical", ""), meta.get("og:url", "")]:
+            own = canonical_url(absolute_url(page_url, own)) if own else ""
+            if own and self.is_event_url(own) and own != detail.url:
+                detail.url = own
+                break
         if not detail.title:
             detail.title = clean_title(meta.get("og:title") or meta.get("h1") or meta.get("title") or "")
         if not detail.description:
@@ -496,6 +590,8 @@ class Source:
         facts = labeled_facts(lines)
         if not detail.organizer and facts.get("organizer") and not is_platform_name(facts["organizer"]):
             detail.organizer = facts["organizer"]
+        if not detail.register_by:
+            detail.register_by = register_by_from_text(lines, ctx.ref)
         for key in ("language", "duration", "age_limit"):
             if facts.get(key) and not getattr(detail, key):
                 setattr(detail, key, facts[key])
@@ -523,7 +619,7 @@ class Source:
             folder = ctx.debug_dir / self.key
             folder.mkdir(parents=True, exist_ok=True)
             existing = len(list(folder.glob(f"{kind}-*.html")))
-            if existing >= 6:
+            if existing >= (60 if kind.startswith("listing") else 12):   # every list page, a sample of events
                 return
             name = f"{kind}-{existing + 1:02d}-{slugify(url)[-80:]}.html"
             (folder / name).write_text(f"<!-- {url} -->\n" + html, encoding="utf-8")

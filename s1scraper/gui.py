@@ -11,6 +11,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from datetime import date, timedelta
 from pathlib import Path
@@ -21,10 +22,25 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import APP_NAME, __version__
 from .cities import CITIES
-from .config import CUSTOM, WINDOW_PRESETS, Settings, SettingsError, compute_window
+from .config import CUSTOM, SETTINGS_FILE, WINDOW_PRESETS, Settings, SettingsError, compute_window
+from .schedule import DAYS, FREQUENCIES, Schedule, ScheduleError, is_blocked_by_macos, mac_access_help
+from .schedule import check_needed as schedule_check_needed
+from .schedule import check_outcome as schedule_check_outcome
+from .schedule import end_check as end_schedule_check
+from .schedule import install as install_schedule
+from .schedule import is_installed as schedule_is_installed
+from .schedule import start_check as start_schedule_check
 from .sources import ALL_SOURCES, GROUP_LABELS
 
 SPEEDS = {"Gentle (safest, slowest)": "gentle", "Normal (recommended)": "normal", "Fast": "fast"}
+# Whole run; when it is near, later dates keep what their listing showed (nearest dates are read first)
+TIME_LIMITS = {"30 min": 30.0, "45 min": 45.0, "1 hour": 60.0, "1.5 hours": 90.0, "2 hours": 120.0,
+               "No limit": 0.0}
+
+
+def limit_label(minutes: float) -> str:
+    m = float(minutes or 0)
+    return next((label for label, v in TIME_LIMITS.items() if v == m), f"{m:g} min")
 
 
 def open_path(path: Path) -> None:
@@ -47,6 +63,8 @@ class App:
             messagebox.showwarning(APP_NAME, f"{exc}\nDefault settings will be used.")
             self.settings = Settings()
         self.events: "queue.Queue[tuple]" = queue.Queue()
+        self._check = None            # background test of the automatic run (macOS)
+        self._check_job = None
         self.worker: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
 
@@ -153,13 +171,14 @@ class App:
         ttk.Label(box, text="Speed:").pack(side="left")
         self.speed_var = tk.StringVar()
         ttk.Combobox(box, textvariable=self.speed_var, values=list(SPEEDS), state="readonly",
-                     width=24).pack(side="left", padx=(4, 16))
+                     width=22).pack(side="left", padx=(4, 14))
+        ttk.Label(box, text="Time limit:").pack(side="left")
+        self.limit_var = tk.StringVar()
+        ttk.Combobox(box, textvariable=self.limit_var, values=list(TIME_LIMITS), state="readonly",
+                     width=9).pack(side="left", padx=(4, 14))
         self.browser_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(box, text="Open pages in Chrome/Edge when needed", variable=self.browser_var).pack(side="left")
-        self.show_browser_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(box, text="Show the browser", variable=self.show_browser_var).pack(side="left", padx=(12, 0))
-        self.city_tabs_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(box, text="One tab per city", variable=self.city_tabs_var).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(box, text="Use Chrome/Edge when needed (works out of sight)",
+                        variable=self.browser_var).pack(side="left")
 
         # actions
         bar = ttk.Frame(outer)
@@ -168,6 +187,13 @@ class App:
         self.run_btn.pack(side="left")
         self.stop_btn = ttk.Button(bar, text="■  Stop", command=self.stop_run, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Automatic runs…", command=self.open_schedule).pack(side="left", padx=(24, 0))
+        self.schedule_label = ttk.Label(bar, text="", style="Sub.TLabel")
+        self.schedule_label.pack(side="left", padx=(8, 0))
+        self.freq_var = tk.StringVar(value="Off")       # the Automatic runs window edits these
+        self.day_var = tk.StringVar(value="Friday")
+        self.time_var = tk.StringVar(value="07:00")
+        self.schedule_win: Optional[tk.Toplevel] = None
         ttk.Button(bar, text="Logs folder", command=self.open_logs).pack(side="right")
         self.diag_btn = ttk.Button(bar, text="Health check", command=self.start_diagnostics)
         self.diag_btn.pack(side="right", padx=(0, 8))
@@ -179,8 +205,11 @@ class App:
 
         logbox = ttk.Frame(outer)
         logbox.pack(fill="both", expand=True, pady=(6, 0))
-        self.log = tk.Text(logbox, height=12, wrap="word", font=("Consolas", 9), state="disabled",
-                           background="#FBFAF7", relief="solid", borderwidth=1)
+        # Colours are set in full: with only the background set, macOS Dark Mode draws white text on it
+        mono = ("Menlo", 11) if sys.platform == "darwin" else ("Consolas", 9)
+        self.log = tk.Text(logbox, height=12, wrap="word", font=mono, state="disabled",
+                           background="#FBFAF7", foreground="#1D2420", insertbackground="#1D2420",
+                           selectbackground="#CFE3DD", selectforeground="#1D2420", relief="solid", borderwidth=1)
         scroll = ttk.Scrollbar(logbox, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side="left", fill="both", expand=True)
@@ -206,9 +235,12 @@ class App:
         for key, var in self.source_vars.items():
             var.set(bool(s.sources.get(key, var.get())))
         self.speed_var.set(next((k for k, v in SPEEDS.items() if v == s.speed), "Normal (recommended)"))
+        self.limit_var.set(limit_label(s.time_limit_minutes))
         self.browser_var.set(bool(s.use_browser))
-        self.show_browser_var.set(bool(s.show_browser))
-        self.city_tabs_var.set(bool(s.city_tabs))
+        self.freq_var.set(FREQUENCIES.get(s.schedule_frequency, "Off"))
+        self.day_var.set(s.schedule_day if s.schedule_day in DAYS else "Friday")
+        self.time_var.set(s.schedule_time or "07:00")
+        self._sync_schedule()
         self._sync_window()
 
     def _read_form(self) -> Settings:
@@ -222,9 +254,11 @@ class App:
         s.cities = [name for name, var in self.city_vars.items() if var.get()]
         s.sources = {key: var.get() for key, var in self.source_vars.items()}
         s.speed = SPEEDS.get(self.speed_var.get(), "normal")
+        s.time_limit_minutes = TIME_LIMITS.get(self.limit_var.get(), s.time_limit_minutes)
         s.use_browser = self.browser_var.get()
-        s.show_browser = self.show_browser_var.get()
-        s.city_tabs = self.city_tabs_var.get()
+        s.schedule_frequency = next((k for k, v in FREQUENCIES.items() if v == self.freq_var.get()), "off")
+        s.schedule_day = self.day_var.get()
+        s.schedule_time = self.time_var.get().strip()
         return s
 
     def _sync_window(self) -> None:
@@ -266,6 +300,157 @@ class App:
         folder = self.settings.data_path / "logs"
         folder.mkdir(parents=True, exist_ok=True)
         open_path(folder)
+
+    def open_schedule(self) -> None:
+        """Small window for automatic runs (kept out of the main form so it fits small screens)."""
+        if self.schedule_win is not None and self.schedule_win.winfo_exists():
+            self.schedule_win.deiconify()
+            self.schedule_win.lift()
+            return
+        win = self.schedule_win = tk.Toplevel(self.root)
+        win.title("Automatic runs")
+        win.transient(self.root)
+        win.resizable(False, False)
+        frame = ttk.Frame(win, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, wraplength=440, justify="left",
+                  text="Run the scraper on its own. " + self.SCHEDULE_USES).pack(anchor="w")
+        row = ttk.Frame(frame)
+        row.pack(anchor="w", pady=(12, 0))
+        self.freq_box = ttk.Combobox(row, textvariable=self.freq_var, values=list(FREQUENCIES.values()),
+                                     state="readonly", width=12)
+        self.freq_box.pack(side="left")
+        self.freq_box.bind("<<ComboboxSelected>>", lambda e: self._sync_schedule())
+        ttk.Label(row, text="on").pack(side="left", padx=(8, 4))
+        self.day_box = ttk.Combobox(row, textvariable=self.day_var, values=DAYS, state="readonly", width=11)
+        self.day_box.pack(side="left")
+        ttk.Label(row, text="at").pack(side="left", padx=(8, 4))
+        self.time_entry = ttk.Entry(row, textvariable=self.time_var, width=7)
+        self.time_entry.pack(side="left")
+        ttk.Label(row, text="(24-hour, e.g. 07:00)", style="Sub.TLabel").pack(side="left", padx=(8, 0))
+        self.schedule_status = ttk.Label(frame, text="", wraplength=440, justify="left")
+        self.schedule_status.pack(anchor="w", pady=(12, 0))
+        ttk.Label(frame, text=self.SCHEDULE_NOTE, wraplength=440, justify="left",
+                  style="Sub.TLabel").pack(anchor="w", pady=(8, 0))
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(14, 0))
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="right")
+        ttk.Button(buttons, text="Save schedule", command=self.save_schedule).pack(side="right", padx=(0, 8))
+        self._sync_schedule()
+
+    def _sync_schedule(self, status: Optional[str] = None) -> None:
+        """Update the line next to the button and, if open, the Automatic runs window."""
+        s = self.settings
+        if status is None:
+            if s.schedule_frequency == "off":
+                status, short = "Off: runs only when you press Run scraper.", "Off"
+            else:
+                try:
+                    short = Schedule(s.schedule_frequency, s.schedule_day, s.schedule_time).validate().describe()
+                    status = f"Active: {short}."
+                except ScheduleError:
+                    status = short = "Settings invalid - pick them again and Save schedule."
+                if not schedule_is_installed():
+                    status += " Not set up on this computer yet - press Save schedule."
+                    short = "not set up on this computer"
+        else:
+            short = status
+        self.schedule_label.configure(text=short if len(short) <= 40 else short[:38] + "…")
+        if self.schedule_win is not None and self.schedule_win.winfo_exists():
+            freq = self.freq_var.get()
+            self.day_box.configure(state="readonly" if freq == FREQUENCIES["weekly"] else "disabled")
+            self.time_entry.configure(state="disabled" if freq == FREQUENCIES["off"] else "normal")
+            self.schedule_status.configure(text=status)
+
+    def save_schedule(self) -> None:
+        """Register the automatic run with this computer, using the Automatic runs window's choices."""
+        settings = self._read_form()
+        try:
+            sched = Schedule(settings.schedule_frequency, settings.schedule_day, settings.schedule_time).validate()
+            if sched.frequency != "off":
+                settings.validate()
+        except (ScheduleError, SettingsError) as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self._dialog_parent())
+            return
+        settings.schedule_day, settings.schedule_time = sched.day, sched.time
+        try:
+            settings.save(self.settings_path)
+            message = install_schedule(sched, self.settings_path or SETTINGS_FILE)
+        except (ScheduleError, OSError) as exc:
+            messagebox.showerror(APP_NAME, f"Could not set up the automatic run:\n\n{exc}", parent=self._dialog_parent())
+            return
+        self.time_var.set(sched.time)
+        self._sync_schedule(message)
+        self.append_log(message)
+        if sched.frequency == "off":
+            return
+        if schedule_check_needed():
+            self._start_background_check(message)
+        else:
+            messagebox.showinfo(APP_NAME, f"{message}\n\n{self.SCHEDULE_USES} {self.SCHEDULE_NOTE}",
+                                parent=self._dialog_parent())
+
+    SCHEDULE_USES = "It uses the date window, cities, sources and workbook chosen in the main window."
+    SCHEDULE_NOTE = ("Keep the computer on (a run missed while asleep happens when it wakes) and the "
+                     "workbook closed in Excel at that time.")
+    CHECK_SECONDS = 120
+
+    def _start_background_check(self, message: str) -> None:
+        """macOS: start the automatic run's access test now, while someone is here to see it."""
+        self._cancel_background_check()
+        try:
+            self._check = start_schedule_check(self.settings_path or SETTINGS_FILE)
+        except (ScheduleError, OSError) as exc:
+            messagebox.showwarning(APP_NAME, f"{message}\n\nThe background test could not start: {exc}",
+                                   parent=self._dialog_parent())
+            return
+        self._sync_schedule("Testing in the background…")
+        self.append_log("Testing the automatic run in the background. If macOS asks whether Python may "
+                        "access a folder, click Allow.")
+        deadline = time.time() + self.CHECK_SECONDS
+
+        def poll() -> None:
+            self._check_job = None
+            outcome = schedule_check_outcome(self._check)
+            if outcome is None and time.time() < deadline:
+                self._check_job = self.root.after(1000, poll)
+                return
+            self._cancel_background_check()
+            self._report_background_check(message, outcome)
+
+        self._check_job = self.root.after(1000, poll)
+
+    def _cancel_background_check(self) -> None:
+        if self._check_job is not None:
+            self.root.after_cancel(self._check_job)
+            self._check_job = None
+        if self._check is not None:
+            try:
+                end_schedule_check(self._check)
+            except OSError:
+                pass
+            self._check = None
+
+    def _report_background_check(self, message: str, outcome) -> None:
+        if outcome is None:
+            outcome = (False, f"The test did not report back within {self.CHECK_SECONDS // 60} minutes.")
+        passed, details = outcome
+        if passed:
+            self._sync_schedule(message.replace("Scheduled: ", "").rstrip(".") + " (tested)")
+            self.append_log("Background test passed: the automatic run can open the app and the workbook.")
+            messagebox.showinfo(APP_NAME, message + "\n\nBackground test passed: the automatic run can open the "
+                                f"app and the workbook.\n\n{self.SCHEDULE_USES} {self.SCHEDULE_NOTE}",
+                                parent=self._dialog_parent())
+            return
+        self._sync_schedule("Saved, but the background test failed")
+        self.append_log(f"Background test failed: {details}")
+        text = mac_access_help(details) if is_blocked_by_macos(details) else (
+            f"The automatic run is saved, but it would fail:\n\n{details}\n\nFix this, then press Save schedule again.")
+        messagebox.showwarning(APP_NAME, text, parent=self._dialog_parent())
+
+    def _dialog_parent(self) -> tk.Misc:
+        win = self.schedule_win
+        return win if win is not None and win.winfo_exists() else self.root
 
     def _busy(self, busy: bool) -> None:
         self.run_btn.configure(state="disabled" if busy else "normal")
@@ -374,7 +559,8 @@ class App:
                     self.progress.stop()
                     self.progress.configure(mode="determinate")
                     self.progress["value"] = 1000
-                    self.status_var.set("Health check finished - see the report above.")
+                    self.status_var.set("Health check finished. The report is in the box below, and saved as "
+                                        "report.txt in the diagnostics folder.")
                     self._busy(False)
                 elif kind == "error":
                     self.progress.stop()
@@ -406,6 +592,7 @@ class App:
                 return
             self.stop_event.set()
             self.worker.join(timeout=15)
+        self._cancel_background_check()
         self.root.destroy()
 
 
@@ -419,10 +606,24 @@ def _dpi_aware() -> None:
             pass
 
 
+def _bring_to_front(root: tk.Tk) -> None:
+    """Show the window in front. On macOS a window started from Terminal
+    otherwise opens behind the Terminal window."""
+    root.deiconify()
+    root.lift()
+    try:
+        root.attributes("-topmost", True)
+        root.after(800, lambda: root.attributes("-topmost", False))
+    except tk.TclError:
+        pass
+    root.focus_force()
+
+
 def main(settings_path: Optional[Path] = None) -> int:
     _dpi_aware()
     root = tk.Tk()
     App(root, settings_path)
+    root.after(200, lambda: _bring_to_front(root))
     root.mainloop()
     return 0
 

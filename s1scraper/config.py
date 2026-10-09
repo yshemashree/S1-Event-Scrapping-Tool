@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime
 from pathlib import Path
@@ -78,10 +80,11 @@ class Settings:
     speed: str = "normal"                  # gentle / normal / fast
     respect_robots_txt: bool = True
     use_browser: bool = True               # open pages in Edge/Chrome when a plain download is not enough
-    show_browser: bool = False
+    show_browser: bool = False             # only for one run with --show-browser; never kept between runs
     browser_channel: str = ""              # msedge / chrome / "" (auto)
     browser_path: str = ""
     max_details_per_source: int = 1500
+    time_limit_minutes: float = 60.0       # whole run (0 = none); nearest dates get their event pages first
     detail_cache_days: float = 10.0
     tier_basis: str = "min"                # min / avg / max ticket price
     include_activities: bool = False       # BookMyShow "activities" (water parks, gaming zones ...)
@@ -113,6 +116,7 @@ class Settings:
             defaults = {src.key: src.enabled_by_default for src in ALL_SOURCES}
             defaults.update({k: bool(v) for k, v in (data.get("sources") or {}).items() if k in defaults})
             s.sources = defaults
+            s.show_browser = False      # the browser always works out of sight (older versions could save True)
         return s
 
     def save(self, path: Optional[Path] = None) -> None:
@@ -127,6 +131,19 @@ class Settings:
     @property
     def data_path(self) -> Path:
         return self.resolve(self.data_dir) if self.data_dir else APP_DIR
+
+    @property
+    def cache_path(self) -> Path:
+        """Folder of the page cache. It lives in the computer's own cache folder rather than next to
+        the app, which often sits on a Desktop that iCloud or OneDrive syncs (a synced folder can swap
+        the file out mid-run). An explicit data_dir keeps everything together."""
+        if self.data_dir:
+            return self.data_path / "cache"
+        if sys.platform == "darwin":
+            return Path.home() / "Library" / "Caches" / "S1 Event Scraper"
+        if os.name == "nt":
+            return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "S1 Event Scraper" / "cache"
+        return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "s1-event-scraper"
 
     def window(self, today: Optional[date] = None) -> Tuple[date, date]:
         return compute_window(self.window_preset, self.window_start, self.window_end, today)
@@ -147,6 +164,11 @@ class Settings:
             raise SettingsError("Pick at least one city.")
         if not self.enabled_sources():
             raise SettingsError("Pick at least one source.")
+        try:
+            if float(self.time_limit_minutes or 0) < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise SettingsError("time_limit_minutes must be a number of minutes (0 = no limit).") from None
         if self.tier_basis not in ("min", "avg", "max"):
             raise SettingsError("tier_basis must be min, avg or max.")
         if not str(self.workbook_path).strip():

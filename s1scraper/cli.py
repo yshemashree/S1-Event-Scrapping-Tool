@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import APP_NAME, __version__
-from .config import CUSTOM, Settings, SettingsError
+from .config import CUSTOM, SETTINGS_FILE, Settings, SettingsError
 from .sources import ALL_SOURCES
 
 
@@ -37,6 +37,13 @@ def setup_logging(settings: Settings, verbose: bool = False) -> Path:
     return path
 
 
+def _notify(args: argparse.Namespace, message: str) -> None:
+    if args.notify:
+        from .schedule import notify
+
+        notify(APP_NAME, message)
+
+
 def build_parser() -> argparse.ArgumentParser:
     keys = ", ".join(s.key for s in ALL_SOURCES)
     p = argparse.ArgumentParser(
@@ -48,8 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
             "  python run_scraper.py                       # use settings.json\n"
             "  python run_scraper.py --window 1w           # next week\n"
             "  python run_scraper.py --window 6m --cities Mumbai Pune\n"
+            "  python run_scraper.py --window 6m --time-limit 90   # six months, at most 1.5 hours\n"
             "  python run_scraper.py --from 2026-10-10 --to 2026-12-31\n"
             "  python run_scraper.py --sources bookmyshow district\n"
+            "  python run_scraper.py --sources district --window 3m --dry-run --find \"Sunidhi Chauhan\"\n"
             "  python run_scraper.py --diagnose            # quick health check of every source\n"
             "  python run_scraper.py --gui                 # open the desktop window\n\n"
             f"Source keys: {keys}"
@@ -64,11 +73,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cities", nargs="+", help="cities to cover (default: all seven)")
     p.add_argument("--sources", nargs="+", help="only these sources (keys listed below)")
     p.add_argument("--speed", choices=["gentle", "normal", "fast"], help="request pacing per site")
+    p.add_argument("--time-limit", "--max-minutes", dest="time_limit", type=float, metavar="MINUTES",
+                   help="finish within about this many minutes (0 = no limit, default 60); "
+                        "the nearest dates get their event pages read first")
     p.add_argument("--no-browser", action="store_true", help="never open pages in a real browser")
-    p.add_argument("--show-browser", action="store_true", help="show the browser window while it works")
+    p.add_argument("--find", nargs="+", metavar="NAME",
+                   help="say for each event name whether it was on a listing page, made it into the sheet, "
+                        "or was left out and why, e.g. --find \"Sunidhi Chauhan\" \"A R Rahman\"")
+    p.add_argument("--dry-run", action="store_true", help="do everything except change the workbook")
+    p.add_argument("--save-pages", action="store_true",
+                   help="keep a copy of every page read in diagnostics/ (to check what a site sent)")
+    p.add_argument("--show-browser", action="store_true",
+                   help="show the browser window for this run only (normally it works out of sight)")
     p.add_argument("--diagnose", action="store_true",
                    help="read one city per source, save raw pages to diagnostics/ and print a health report")
     p.add_argument("--save-settings", action="store_true", help="store the given options in settings.json")
+    p.add_argument("--notify", action="store_true", help="show a desktop notification when done (scheduled runs)")
+    p.add_argument("--check-access", type=Path, metavar="FILE", help=argparse.SUPPRESS)   # the app's schedule test
     p.add_argument("--verbose", "-v", action="store_true", help="print debug logging")
     p.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     return p
@@ -97,6 +118,10 @@ def apply_args(settings: Settings, args: argparse.Namespace) -> Settings:
         settings.sources = {s.key: s.key in wanted for s in ALL_SOURCES}
     if args.speed:
         settings.speed = args.speed
+    if args.time_limit is not None:
+        if args.time_limit < 0:
+            raise SettingsError("--time-limit must be 0 (no limit) or a number of minutes.")
+        settings.time_limit_minutes = args.time_limit
     if args.no_browser:
         settings.use_browser = False
     if args.show_browser:
@@ -106,6 +131,10 @@ def apply_args(settings: Settings, args: argparse.Namespace) -> Settings:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.check_access:
+        from .schedule import write_check_result
+
+        return write_check_result(args.settings or SETTINGS_FILE, args.check_access)
     if args.gui:
         try:
             from .gui import main as gui_main
@@ -122,6 +151,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         settings.validate()
     except SettingsError as exc:
         print(f"Settings problem: {exc}", file=sys.stderr)
+        _notify(args, f"Did not run - settings problem: {exc}")
         return 2
     if args.save_settings:
         settings.save(args.settings)
@@ -146,7 +176,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     def log_line(msg: str) -> None:
         print("\r" + " " * 110 + "\r" + msg, flush=True)
 
-    runner = Runner(settings, log_fn=log_line, progress_fn=progress, stop_event=stop)
+    pages_dir = None
+    if args.save_pages:
+        pages_dir = settings.data_path / "diagnostics" / f"pages_{datetime.now():%Y%m%d_%H%M%S}"
+        pages_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Saving every page read in: {pages_dir}")
+    runner = Runner(settings, log_fn=log_line, progress_fn=progress, stop_event=stop, find=args.find or (),
+                    debug_dir=pages_dir, write_excel=not args.dry_run)
     try:
         report = runner.run()
     except KeyboardInterrupt:
@@ -155,11 +191,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 130
     except SettingsError as exc:
         print(f"\nSettings problem: {exc}", file=sys.stderr)
+        _notify(args, f"Did not run - settings problem: {exc}")
         return 2
+    except Exception as exc:
+        _notify(args, f"The run failed: {exc} (details in the logs folder)")
+        raise
     print()
-    for line in report.summary_lines():
+    lines = report.summary_lines()
+    for line in lines:
         print(line)
+    if args.dry_run:
+        print("Dry run: the workbook was not changed.")
     print(f"Log: {log_path}")
+    _notify(args, f"{len(report.events)} events, {report.new_in_master} new in Master"
+                  if report.saved_to else (lines[-1] if lines else "Finished"))
     if report.cancelled:
         return 130
     return 0 if report.events or not report.error else 1

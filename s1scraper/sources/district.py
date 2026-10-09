@@ -30,9 +30,22 @@ class District(Source):
         "ahmedabad": ("ahmedabad",),
         "chennai": ("chennai",),
     }
-    listing_templates = ("https://www.district.in/events/upcoming-events-in-{slug}",)
+    # The general page shows only the next few days. The category lists
+    # (/events/music-in-mumbai-book-tickets, comedy-shows-..., performances-...) carry the big concerts,
+    # comedy and theatre further out, so every city reads them too.
+    listing_templates = (
+        "https://www.district.in/events/upcoming-events-in-{slug}",
+        "https://www.district.in/events/music-in-{slug}-book-tickets",
+        "https://www.district.in/events/comedy-shows-in-{slug}-book-tickets",
+        "https://www.district.in/events/performances-in-{slug}-book-tickets",
+        "https://www.district.in/events/sports-events-in-{slug}-book-tickets",
+        "https://www.district.in/events/nightlife-in-{slug}-book-tickets",
+    )
+    # any other category list of the same city it links to (navratri-in-..., food-and-drinks-in-...),
+    # but not the today / this-weekend slices, which only repeat the same events
     follow_patterns = (
-        r"^https://www\.district\.in/events/[a-z0-9-]+-in-{slug}(?:\?[^#]*)?$",
+        r"^https://www\.district\.in/events/(?![a-z0-9-]*(?:this-weekend|today|tomorrow))"
+        r"[a-z0-9-]+-in-{slug}(?:-book-tickets)?(?:\?[^#]*)?$",
     )
     event_pattern = r"^https?://(?:www\.)?district\.in/events/[a-z0-9][a-z0-9-]*[a-z0-9]$"
     id_pattern = r"/events/([a-z0-9-]+)$"
