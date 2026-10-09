@@ -142,5 +142,6 @@ def test_bookmyshow_city_lists_are_filled_in_by_the_browser():
                      ref=date(2026, 10, 9))
     bms = BookMyShow()
     bms.load_listing(ctx, "https://in.bookmyshow.com/explore/events-pune", seed=True)
+    bms.load_listing(ctx, "https://in.bookmyshow.com/explore/plays-pune", seed=True)  # short list: plain
     bms.load_listing(ctx, "https://in.bookmyshow.com/explore/comedy-shows-pune")     # a follow-on list
     assert rendered == ["https://in.bookmyshow.com/explore/events-pune"]

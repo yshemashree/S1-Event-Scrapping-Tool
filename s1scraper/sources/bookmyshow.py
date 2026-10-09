@@ -55,6 +55,11 @@ class BookMyShow(Source):
     min_gap = (2.5, 5.0)
     _kind = "events"                 # section of the listing being read: events / plays / sports
 
+    def load_listing(self, ctx: RunContext, url: str, seed: bool = False) -> PageData:
+        # Only the main events list of each city goes through the browser (BookMyShow turns the
+        # browser away after a few dozen pages); the shorter plays and sports lists are read plainly.
+        return super().load_listing(ctx, url, seed=seed and "/explore/events-" in url)
+
     def extract_listing(self, ctx: RunContext, page: PageData, city: Optional[City]) -> List[Event]:
         m = re.search(r"/explore/(events|plays|sports|activities)-", page.final_url or page.url)
         self._kind = m.group(1) if m else "events"
