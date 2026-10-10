@@ -331,3 +331,19 @@ def test_find_says_where_each_event_went(tmp_path, fake_web):
     assert "left out (other city): \"Rangtarang Garba Nights 2026\"" in text
     assert 'Find "Imaginary Band": not on any listing page this run read.' in text
     assert Path(s.workbook_path).read_bytes() == before          # a dry run leaves the workbook alone
+
+
+def test_register_by_without_a_deadline_is_the_last_day_you_can_go():
+    from s1scraper.models import Event
+    from s1scraper.pipeline import settle_register_by
+
+    run = Event(title="Clay Workshop", start=datetime(2026, 10, 9), end=datetime(2026, 11, 1))
+    settle_register_by(run, TODAY)
+    assert run.register_by == datetime(2026, 11, 1) and run.register_by_inferred     # not 9 Oct, already past
+    sale = Event(title="Garba Nights", start=datetime(2026, 10, 9), end=datetime(2026, 10, 20),
+                 register_by=datetime(2026, 10, 15))
+    settle_register_by(sale, TODAY)
+    assert sale.register_by == datetime(2026, 10, 15) and not sale.register_by_inferred   # published: kept
+    many = Event(title="Open Mic", start=datetime(2026, 10, 3), end_known=False)
+    settle_register_by(many, TODAY)
+    assert many.register_by.date() == TODAY and many.register_by_inferred                 # not before today

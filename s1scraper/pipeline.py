@@ -238,19 +238,24 @@ def settle_dates(ev: Event, w_start: date, w_end: date) -> bool:
     return True
 
 
-def settle_register_by(ev: Event) -> None:
-    """Register By: the site's own deadline, never after the event starts; without one, the
-    event's start (registration stays open until then), marked as inferred."""
+def settle_register_by(ev: Event, from_date: Optional[date] = None) -> None:
+    """Register By: the site's own deadline, never after the event's last day. Without one, the last day
+    you can still go (a run's end date, or the date of a one-day event), marked as inferred; for an event
+    running on many dates, its start, though never before ``from_date`` (the first day of the window)."""
+    runs = ev.end_known and ev.end is not None and ev.start is not None and ev.end.date() > ev.start.date()
+    last = ev.end if runs else ev.start
     rb = ev.register_by
     if rb is not None and ev.start is not None:
-        if rb > ev.start:
-            rb = ev.start
+        if rb > last:
+            rb = last
         if rb < ev.start - timedelta(days=365):
             rb = None
-    if rb is None:
-        ev.register_by, ev.register_by_inferred = ev.start, True
-    else:
+    if rb is not None:
         ev.register_by, ev.register_by_inferred = rb, False
+        return
+    if last is not None and from_date is not None and last.date() < from_date:
+        last = datetime.combine(from_date, time())
+    ev.register_by, ev.register_by_inferred = last, True
 
 
 _JUNK_VENUE_RE = re.compile(r"^(?:sales end soon|sales ended|sold out|almost full|going fast|selling fast|"
@@ -655,7 +660,7 @@ class Runner:
             if not ev.organizer:
                 # Requested fallback: no organiser published -> name the source
                 ev.organizer = "Source: " + " / ".join(ev.platforms or [ev.platform])
-            settle_register_by(ev)
+            settle_register_by(ev, w_start)
             ev.notes = build_notes(ev)
         out.sort(key=lambda e: (max(e.start.date(), w_start) if e.start else w_end,
                                 CITY_ORDER.get(e.city, 99), e.title.lower()))

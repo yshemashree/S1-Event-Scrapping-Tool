@@ -122,8 +122,8 @@ def test_client_sheet_has_no_prices_platforms_or_links(settings):
     write_workbook(settings, EVENTS(), report())
     ws = load_workbook(settings.workbook_path)["Rolling Calendar"]
     header = [ws.cell(row=3, column=c).value for c in range(1, ws.max_column + 1)]
-    assert header == HEADERS and len(HEADERS) == 13
-    assert not {"Price Range", "Ticket Platform(s)", "Link"} & set(header)
+    assert header == HEADERS and len(HEADERS) == 12
+    assert not {"Price Range", "Organizer", "Ticket Platform(s)", "Link"} & set(header)
     assert header[4:6] == ["Register By", "Start Date"]
     assert not [c.coordinate for row in ws.iter_rows() for c in row if c.hyperlink]
     texts = [str(c.value) for row in ws.iter_rows(min_row=4) for c in row if c.value]
@@ -175,7 +175,7 @@ def test_rolling_sheet_is_rebuilt_each_run(settings):
     assert [ws.cell(row=3, column=c).value for c in range(1, len(HEADERS) + 1)] == HEADERS
     titles = [ws.cell(row=r, column=2).value for r in range(4, ws.max_row + 1) if ws.cell(row=r, column=2).value]
     assert titles == ["Prateek Kuhad Live"]
-    assert ws.freeze_panes == "C4" and ws.auto_filter.ref.startswith("A3:M")
+    assert ws.freeze_panes == "C4" and ws.auto_filter.ref.startswith("A3:L")
     assert ws["A4"].value == "▌ MUMBAI · 1 EVENT"
     assert wb.active.title == "Rolling Calendar"
 

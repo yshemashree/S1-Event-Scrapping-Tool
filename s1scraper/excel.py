@@ -8,7 +8,7 @@
   columns are removed and Register By sits beside Start Date.
 * **Rolling Calendar** (the client's sheet) is rebuilt from scratch on every
   run for the chosen window, in the Master's visual style, city by city, each
-  city in date order. It leaves out prices, platforms and links.
+  city in date order. It leaves out prices, organisers, platforms and links.
 * A hidden append-only **Run Log**, and optional per-city tabs and a
   **Summary** sheet with live formulas (off by default: the client works
   from the Master and the Rolling Calendar only).
@@ -86,10 +86,10 @@ FIELDS: Dict[str, Tuple[float, str, bool]] = {
     "Region": (8, "center", False),
     "Added On": (11, "center", False),
 }
-# StepOne's call: the client's sheet shows no prices, ticket platforms or links. The Master keeps the
-# price range (the tier is worked out from it) but not the platforms or links either.
+# StepOne's call: the client's sheet shows no prices, organisers, ticket platforms or links. The Master
+# keeps the price range (the tier is worked out from it) and the organiser, but not platforms or links.
 MASTER_HEADERS = list(FIELDS)
-HEADERS = [h for h in MASTER_HEADERS if h != "Price Range"]
+HEADERS = [h for h in MASTER_HEADERS if h not in ("Price Range", "Organizer")]
 COLUMNS: List[Tuple[str, float, str, bool]] = [(h, *FIELDS[h]) for h in HEADERS]   # the Rolling Calendar
 DROPPED_HEADERS = ("ticketplatforms", "ticketplatform", "link", "links")           # normalised, see _norm_header
 DATE_HEADERS = ("Register By", "Start Date", "End Date", "Added On")
@@ -812,8 +812,8 @@ def write_summary(wb: Workbook, ws: Worksheet, rolling_title: str, last_row: int
         "Activity Type: from each platform's own category, then the event title and description.",
         "Organizer: as published on the event page; when none is published the cell names the source "
         "platform (shown in grey italics, e.g. 'Source: BookMyShow').",
-        "Register By: the booking deadline the site publishes; in grey when there is none and the start date "
-        "is shown. End Date: 'Multiple dates' when an event runs on many dates.",
+        "Register By: the booking deadline the site publishes; in grey when there is none and the last day "
+        "you can go is shown. End Date: 'Multiple dates' when an event runs on many dates.",
         "Master Calander: new events are only appended below the last row. The Rolling Calendar and city "
         "tabs are rebuilt on every run. Duplicates listed on several platforms are merged into one row.",
     ]
@@ -1022,8 +1022,8 @@ def write_workbook(settings, events: Sequence[Event], report) -> WriteResult:
     title = f"ROLLING EVENTS CALENDAR · {span} · " + " · ".join(c.upper() for c in report.cities)
     subtitle = (f"Sources: {_source_line(events, report.sources)}  |  {len(events)} events  |  City by city, "
                 f"each in date order  |  Last updated: {run_at:%d %b %Y, %I:%M %p} IST  |  Tier = entry ticket price "
-                f"(see Guide)  |  Register By in grey: the site gives no separate deadline, so the start date is "
-                f"shown  |  {MULTIPLE_DATES}: runs on many dates, see the link  |  Use the filter arrows in "
+                f"(see Guide)  |  Register By in grey: the site gives no separate deadline, so the last day you can "
+                f"go is shown  |  {MULTIPLE_DATES}: runs on many dates  |  Use the filter arrows in "
                 f"row 3 to pick a city, tier or category")
     failed = getattr(report, "failed_sources", None) or []
     if failed:

@@ -10,8 +10,8 @@ and venues in the workbook's Guide, and writes the results straight into the Exc
   city, each city in date order.
 * Every run finishes within the **Time limit** chosen in the window (1 hour by default). The nearest
   dates are read in full first.
-* Every row has the **Organizer** (or `Source: <platform>` when none is published), a **Register By**
-  date beside the start date, and an **End Date** only when it can be trusted.
+* Every row has a **Register By** date beside the start date, and an **End Date** only when it can be
+  trusted. The Master also keeps the **Organizer** (or `Source: <platform>` when none is published).
 * No accounts, no logins, no paid third-party scraping services: the scraper reads public pages
   at a gentle, human pace so the office IP is not flagged (see [Staying unblocked](#staying-unblocked)).
 
@@ -88,7 +88,7 @@ over - the fix is usually a one-line URL change in `s1scraper/sources/`.
 |---|---|
 | **Guide** | Untouched. |
 | **Master Calander** | Append-only. Each run adds the events it has not seen before under a band like `▌ SCRAPER UPDATE · 08 OCT 2026 · 132 NEW EVENTS`, styled like the hand-typed rows. Existing rows are never edited. Events already typed in by hand (same title, city and date) are not added again, and an event whose row you delete is not re-added on the next run. One-time layout change, as StepOne asked: the first run of this version removes the **Ticket Platform(s)** and **Link** columns and adds **Register By** beside Start Date (every other cell keeps its value and look, and the workbook is copied to `backups/` first). **Added On** is added at the end if missing. |
-| **Rolling Calendar** | The client's sheet, rebuilt every run: all events in the window, city by city (Mumbai, Pune, Delhi NCR, Bengaluru, Kolkata, Ahmedabad, Chennai) under a band per city, each city in date order. No prices, ticket platforms or links. Frozen header, filter arrows on every column (filter by city, tier, category …), print-ready landscape layout. |
+| **Rolling Calendar** | The client's sheet, rebuilt every run: all events in the window, city by city (Mumbai, Pune, Delhi NCR, Bengaluru, Kolkata, Ahmedabad, Chennai) under a band per city, each city in date order. No prices, organisers, ticket platforms or links. Frozen header, filter arrows on every column (filter by city, tier, category …), print-ready landscape layout. |
 | **Run Log** (hidden) | One line per run: when, window, events found, new rows in Master, per-source counts, warnings, minutes taken and event pages read. Right-click a tab → *Unhide* to see it. |
 
 So the visible tabs stay exactly as in StepOne's sheet: the Guide, the Master (StepOne's own record) and the
@@ -96,12 +96,14 @@ Rolling Calendar (the one shared with the client). One tab per city and a Summar
 can be switched on with `city_tabs` / `summary_tab` in `settings.json`.
 
 Rolling Calendar columns: **S.No. · Event Name · Activity Type · Tier · Register By · Start Date · End Date ·
-City / Cities · Venue · Organizer · Notes · Region · Added On**.
-The Master has the same columns plus **Price Range** after Organizer (the tier is worked out from it).
+City / Cities · Venue · Notes · Region · Added On**.
+The Master has the same columns plus **Organizer** and **Price Range** after Venue (the tier is worked out
+from the price).
 
 * **Register By** is the booking or registration deadline the site itself publishes (end of ticket
-  sales, "registrations close on …"), never later than the start. When the site gives no separate
-  deadline, the start date is shown in grey italics.
+  sales, "registrations close on …"), never later than the event's last day. When the site gives no
+  separate deadline, the last day you can go is shown in grey italics: the date of a one-day event, or
+  the end date of a run (a workshop held daily until 1 Nov shows 1 Nov, not a start date already past).
 * **End Date** is only filled when it can be trusted. A late show that ends after midnight counts as
   one evening. An event running on many dates over more than a month says *Multiple dates* (grey
   italics), unless it is an exhibition or festival whose own page gives its closing date. A weekly
